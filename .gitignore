@@ -1,0 +1,83 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Env files (don’t commit secrets)
+.env
+.env.*
+!.env.example
+
+# Build / cache
+coverage
+.vite
+.cache
+.eslintcache
+
+# Package manager / tooling
+.pnpm-store
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+# Misc
+*.tsbuildinfo
+
+
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+
+# Env files (don’t commit secrets)
+.env
+.env.*
+!.env.example
+
+# Build / cache
+coverage
+.vite
+.cache
+.eslintcache
+
+# Package manager / tooling
+.pnpm-store
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+# Misc
+*.tsbuildinfo
+
+
+#cursor
+.cursor

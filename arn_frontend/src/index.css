@@ -1,0 +1,89 @@
+:root {
+  --text: #334155;
+  --text-h: #0f172a;
+  --bg: #f5f6f8;
+  --panel-bg: #ffffff;
+  --border: #dbe3ee;
+  --code-bg: #eef2ff;
+  --accent: #4f46e5;
+  --accent-bg: rgba(79, 70, 229, 0.12);
+  --success-bg: rgba(16, 185, 129, 0.08);
+
+  --brs-main-bg: #f5f6f8;
+  --brs-text: #475569;
+  --brs-text-strong: #0f172a;
+  --brs-border-soft: #e8ecf1;
+  --brs-font: 'DM Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+
+  /* BRS panel mock tokens (brs_agent_web_panel_layout) */
+  --font-sans: var(--brs-font);
+  --border-radius-lg: 12px;
+  --border-radius-md: 8px;
+  --color-background-primary: #ffffff;
+  --color-background-secondary: #f4f3ef;
+  --color-background-tertiary: #ebeae4;
+  --color-text-primary: #1c1b19;
+  --color-text-secondary: #5f5e5a;
+  --color-text-tertiary: #888780;
+  --color-border-tertiary: #e0ded6;
+  --color-border-secondary: #c9c6bc;
+  --color-brand-purple: #534ab7;
+  --color-brand-purple-muted: #eeedfe;
+  --color-brand-purple-text: #3c3489;
+
+  color-scheme: light;
+  color: var(--text);
+  background: var(--bg);
+  font-family: var(--brs-font);
+  line-height: 1.45;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+}
+
+h1,
+h2 {
+  font-weight: 700;
+  color: var(--text-h);
+  margin: 0;
+}
+
+h1 {
+  font-size: 1.8rem;
+  margin-bottom: 8px;
+}
+
+h2 {
+  font-size: 1.1rem;
+  margin-bottom: 8px;
+}
+
+h3 {
+  font-size: 1rem;
+  margin: 0 0 8px;
+  color: var(--text-h);
+}
+
+p {
+  margin: 0 0 8px;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9rem;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--code-bg);
+  color: var(--text-h);
+}

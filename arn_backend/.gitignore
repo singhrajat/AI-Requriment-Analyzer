@@ -1,0 +1,30 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+
+# Env files (don’t commit secrets)
+.env
+.env.*
+!.env.example
+
+# Build / cache
+coverage
+.vite
+.cache
+.eslintcache
+
+# Package manager / tooling
+.pnpm-store
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+# Misc
+*.tsbuildinfo
