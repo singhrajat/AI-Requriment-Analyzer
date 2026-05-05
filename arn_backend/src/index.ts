@@ -29,7 +29,7 @@ app.use(
     origin: [
       "http://localhost:5173",
       "http://127.0.0.1:5173",
-      "http://AI-Requriment-Analyzer.railway.internal:3000",
+      "https://ai-requirement-analyzer-prod.up.railway.app",
     ],
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
