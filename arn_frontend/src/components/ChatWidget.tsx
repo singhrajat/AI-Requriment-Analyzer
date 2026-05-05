@@ -200,7 +200,7 @@ export function ChatWidget() {
                 key={i}
                 className={`chat-widget-bubble ${m.role === "error" ? "error" : m.role}`}
               >
-                {"citations" in m && m.role === "assistant" && !m.content && sending && i === messages.length - 1 ? (
+                {m.role === "assistant" && !m.content && sending && i === messages.length - 1 ? (
                   <span className="chat-widget-thinking" aria-label="Assistant is thinking">
                     <span className="chat-widget-thinking-dot" />
                     <span className="chat-widget-thinking-dot" />
