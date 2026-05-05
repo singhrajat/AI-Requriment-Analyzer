@@ -10,5 +10,8 @@ const envCandidates = [
 const envPath = envCandidates.find((p) => fs.existsSync(p));
 const envResult = dotenv.config(envPath ? { path: envPath } : undefined);
 if (envResult.error) {
-  throw envResult.error;
+  if ((envResult.error as NodeJS.ErrnoException).code !== "ENOENT") {
+    throw envResult.error;
+  }
+  // No .env file found — fall back to environment variables already set in the runtime (e.g. Railway)
 }
