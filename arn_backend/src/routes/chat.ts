@@ -1,17 +1,27 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { streamDirectChat, streamRagChat, type ChatHistoryItem } from "../services/chatService";
+import { streamRagChat, type ChatHistoryItem } from "../services/chatService";
 
 const chatMessageSchema = z.object({
   role: z.enum(["user", "assistant", "system"]),
   content: z.string().max(120_000),
 });
 
-const chatRequestSchema = z.object({
-  message: z.string().min(1).max(16_000),
-  useDbSearch: z.boolean(),
-  history: z.array(chatMessageSchema).max(50).optional().default([]),
-});
+/** Mongo ObjectId hex format; keeps invalid runIds out of Qdrant filter queries. */
+const mongoIdSchema = z.string().regex(/^[a-f0-9]{24}$/i);
+
+const chatRequestSchema = z
+  .object({
+    message: z.string().min(1).max(16_000),
+    history: z.array(chatMessageSchema).max(50).optional().default([]),
+    runId: mongoIdSchema.optional(),
+    /** When true, RAG includes merge-report vectors; requires runId. */
+    includeMergeReportInRag: z.boolean().optional(),
+  })
+  .refine((data) => data.includeMergeReportInRag !== true || data.runId !== undefined, {
+    message: "runId is required when includeMergeReportInRag is true",
+    path: ["runId"],
+  });
 
 const router = Router();
 
@@ -25,7 +35,7 @@ router.post("/", async (req: Request, res: Response) => {
     return;
   }
 
-  const { message, useDbSearch, history } = parsed.data;
+  const { message, history, runId, includeMergeReportInRag } = parsed.data;
   const hist: ChatHistoryItem[] = history.map((h) => ({
     role: h.role,
     content: h.content,
@@ -41,12 +51,17 @@ router.post("/", async (req: Request, res: Response) => {
 
   const writeSse = (obj: unknown) => {
     res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    const resWithFlush = res as Response & { flush?: () => void };
+    resWithFlush.flush?.();
   };
 
   try {
-    const stream = useDbSearch
-      ? streamRagChat({ message, history: hist })
-      : streamDirectChat({ message, history: hist });
+    const stream = streamRagChat({
+      message,
+      history: hist,
+      runId,
+      ...(includeMergeReportInRag === true ? { includeMergeReportInRag: true } : {}),
+    });
 
     for await (const evt of stream) {
       writeSse(evt);

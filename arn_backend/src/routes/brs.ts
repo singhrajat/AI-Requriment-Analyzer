@@ -4,6 +4,11 @@ import { z } from "zod";
 import { BrsPipelineRun } from "../models/BrsPipelineRun";
 import { extractDocumentText } from "../services/extractDocumentText";
 import { launchBrsPipeline } from "../services/brsPipelineGraph";
+import {
+  deleteMergeReportPointsForRun,
+  deleteQdrantPointsForRun,
+} from "../services/qdrantBrsStore";
+import { embedMergeReportForRun } from "../services/mergeReportRagChunks";
 import { buildBrsRunDocxBuffer, safeDocxAttachmentName } from "../services/brsRunDocxExport";
 
 const router = Router();
@@ -175,6 +180,11 @@ router.post(
         run.completedAt = new Date();
         run.awaitingUserDecision = false;
         await run.save();
+        try {
+          await embedMergeReportForRun(run._id.toString());
+        } catch (embedErr) {
+          console.error(`[brs] merge embed failed for run ${run._id}:`, embedErr);
+        }
         res.json({ ok: true, status: run.status });
         return;
       }
@@ -185,6 +195,11 @@ router.post(
       run.stages.merge = "pending";
       run.status = "needs_human_review";
       await run.save();
+      try {
+        await deleteMergeReportPointsForRun(run._id.toString());
+      } catch (delErr) {
+        console.error(`[brs] merge points delete failed for run ${run._id}:`, delErr);
+      }
       res.json({ ok: true, status: run.status });
     } catch (err) {
       next(err);
@@ -280,11 +295,18 @@ router.post("/runs/:id/control", async (req: Request, res: Response, next: NextF
 // DELETE /api/brs/runs/:id
 router.delete("/runs/:id", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const deleted = await BrsPipelineRun.findByIdAndDelete(req.params.id);
-    if (!deleted) {
+    const id = req.params.id;
+    const existing = await BrsPipelineRun.findById(id).select("_id").lean();
+    if (!existing) {
       res.status(404).json({ error: "Run not found" });
       return;
     }
+    try {
+      await deleteQdrantPointsForRun(id);
+    } catch (qErr) {
+      console.error(`Qdrant delete failed for run ${id}:`, qErr);
+    }
+    await BrsPipelineRun.deleteOne({ _id: id });
     res.status(204).send();
   } catch (err) {
     next(err);

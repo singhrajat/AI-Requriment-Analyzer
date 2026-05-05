@@ -1,10 +1,18 @@
 import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
 import { HumanMessage } from "@langchain/core/messages";
 import { BrsPipelineRun } from "../models/BrsPipelineRun";
-import { getChatModelForRole, getChatModelIdForRole, getLangfuse, getReviewerChatModel } from "../config/modelConfig";
+import {
+  getChatModelForRole,
+  getChatModelIdForRole,
+  getLangfuse,
+  getOpenAIEmbeddings,
+  getOpenAiEmbeddingModelId,
+  getReviewerChatModel,
+} from "../config/modelConfig";
 import { isSmallInput } from "./tokenCounter";
-import { chunkDocumentText } from "./chunkDocumentText";
-import { embedText, embedTexts } from "./voyageEmbeddings";
+import { splitBrsDocumentTextSectionWise } from "./brsRecursiveChunk";
+import { brsPointId, upsertBrsVectors } from "./qdrantBrsStore";
+import { embedMergeReportForRun } from "./mergeReportRagChunks";
 import {
   FETCH_AGENT_PROMPT,
   CHUNK_MERGE_PROMPT,
@@ -19,6 +27,7 @@ import {
   normalizeBlockingIssue,
   type ParsedBrsReview,
 } from "../schemas/brsReviewerOutput";
+import { formatJsonLikeOutput } from "../utils/parseJsonLikeOutput";
 
 // ── State ──────────────────────────────────────────────────────────────────────
 
@@ -187,8 +196,14 @@ function buildCorrectivesForPm(review: ParsedBrsReview): string {
 
 async function embedAndMeasure(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({ name: "brs-pipeline", input: { runId: state.runId } });
-  const span = trace.span({ name: "embedAndMeasure" });
+  const trace = langfuse.trace({
+    name: "brs-pipeline",
+    input: { runId: state.runId, documentText: state.documentText },
+  });
+  const span = trace.span({
+    name: "embedAndMeasure",
+    input: { runId: state.runId, documentText: state.documentText },
+  });
 
   try {
     if (await stopIfRequested(state.runId)) {
@@ -205,6 +220,7 @@ async function embedAndMeasure(state: PipelineStateType): Promise<Partial<Pipeli
           reused: true,
           inputSizeClass: existing.inputSizeClass,
           chunkCount: existing.chunkCount,
+          documentText: existing.documentText,
         },
       });
       return {
@@ -217,20 +233,38 @@ async function embedAndMeasure(state: PipelineStateType): Promise<Partial<Pipeli
 
     const small = isSmallInput(state.documentText);
     const inputSizeClass: "small" | "large" = small ? "small" : "large";
-    const chunks = small ? [] : chunkDocumentText(state.documentText);
+    const chunks = small ? [] : await splitBrsDocumentTextSectionWise(state.documentText);
     const chunkCount = small ? 0 : chunks.length;
 
     await updateRun(state.runId, { inputSizeClass, chunkCount, documentText: state.documentText });
 
+    const meta = await BrsPipelineRun.findById(state.runId).select("displayName originalFileName").lean();
+    const sourceName = meta?.displayName || meta?.originalFileName || state.runId;
+    const embedModel = getOpenAiEmbeddingModelId();
+
     try {
+      const embeddings = getOpenAIEmbeddings();
       if (small) {
-        const vector = await embedText(state.documentText, { inputType: "document" });
+        const trimmed = state.documentText.trim();
+        const batchVec = await embeddings.embedDocuments([trimmed]);
+        const vector = batchVec[0];
+        await upsertBrsVectors([
+          {
+            id: brsPointId(state.runId, "brs_full"),
+            vector,
+            payload: {
+              runId: state.runId,
+              sourceName,
+              kind: "brs_full",
+              text: trimmed,
+            },
+          },
+        ]);
         await updateRun(state.runId, {
           "embeddings.brs": {
-            provider: "voyage",
-            model: "voyage-3.5-lite",
+            provider: "openai",
+            model: embedModel,
             strategy: "single",
-            vector,
             createdAt: new Date(),
           },
         });
@@ -243,27 +277,32 @@ async function embedAndMeasure(state: PipelineStateType): Promise<Partial<Pipeli
         });
       } else {
         const texts = chunks.map((c) => c.text);
-        const BATCH = 64;
-        const vectors: number[][] = [];
-        for (let i = 0; i < texts.length; i += BATCH) {
-          const batch = texts.slice(i, i + BATCH);
-          const batchVectors = await embedTexts(batch, { inputType: "document" });
-          vectors.push(...batchVectors);
-        }
+        const vectors = await embeddings.embedDocuments(texts);
 
-        const chunkEmbeddings = chunks.map((c, i) => ({
-          index: i,
-          charStart: c.charStart,
-          charEnd: c.charEnd,
+        const points = chunks.map((c, i) => ({
+          id: brsPointId(state.runId, "brs_chunk", c.index),
           vector: vectors[i],
+          payload: {
+            runId: state.runId,
+            sourceName,
+            kind: "brs_chunk" as const,
+            chunkIndex: c.index,
+            text: c.text,
+            sectionNumber: c.sectionNumber,
+            sectionTitle: c.sectionTitle,
+            headingPath: c.headingPath,
+            partIndex: c.partIndex,
+            partCount: c.partCount,
+          },
         }));
+
+        await upsertBrsVectors(points);
 
         await updateRun(state.runId, {
           "embeddings.brs": {
-            provider: "voyage",
-            model: "voyage-3.5-lite",
+            provider: "openai",
+            model: embedModel,
             strategy: "chunked",
-            chunks: chunkEmbeddings,
             createdAt: new Date(),
           },
         });
@@ -281,7 +320,7 @@ async function embedAndMeasure(state: PipelineStateType): Promise<Partial<Pipeli
         });
       }
     } catch (err) {
-      console.error(`Voyage embedding failed for run ${state.runId}:`, err);
+      console.error(`OpenAI/Qdrant embedding failed for run ${state.runId}:`, err);
       span.end({
         output: {
           inputSizeClass,
@@ -304,29 +343,37 @@ function routeBySize(state: PipelineStateType): "fetchSmall" | "chunkAndFetch" |
 
 async function fetchSmall(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({ name: "brs-pipeline", input: { runId: state.runId } });
-  const span = trace.span({ name: "fetchSmall" });
+  const trace = langfuse.trace({
+    name: "brs-pipeline",
+    input: { runId: state.runId, documentText: state.documentText },
+  });
 
   try {
     if (await stopIfRequested(state.runId)) {
+      const span = trace.span({ name: "fetchSmall", input: { pausedCheck: true } });
       span.end({ output: { paused: true } });
       return { halted: true };
     }
 
     const run = await BrsPipelineRun.findById(state.runId).select("stages.fetch fetchOutput documentText").lean();
     if (run?.stages?.fetch === "done" && typeof run.fetchOutput === "string" && run.fetchOutput.length > 0) {
-      span.end({ output: { reused: true, length: run.fetchOutput.length } });
+      const span = trace.span({
+        name: "fetchSmall",
+        input: { reusedFromPersistence: true, documentText: state.documentText },
+      });
+      span.end({ output: { fetchOutput: run.fetchOutput } });
       return { fetchResult: run.fetchOutput };
     }
 
     const prompt = interpolate(FETCH_AGENT_PROMPT, { documentText: state.documentText });
+    const span = trace.span({ name: "fetchSmall", input: { prompt } });
     const result = await callModel("fetch", prompt);
 
     await updateRun(state.runId, {
       "stages.fetch": "done",
       fetchOutput: result,
     });
-    span.end({ output: { length: result.length } });
+    span.end({ output: { fetchOutput: result } });
     return { fetchResult: result };
   } finally {
     await langfuse.flushAsync();
@@ -335,32 +382,56 @@ async function fetchSmall(state: PipelineStateType): Promise<Partial<PipelineSta
 
 async function chunkAndFetch(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({ name: "brs-pipeline", input: { runId: state.runId } });
-  const span = trace.span({ name: "chunkAndFetch" });
+  const trace = langfuse.trace({
+    name: "brs-pipeline",
+    input: { runId: state.runId, documentText: state.documentText },
+  });
 
   try {
     if (await stopIfRequested(state.runId)) {
+      const span = trace.span({ name: "chunkAndFetch", input: { pausedCheck: true } });
       span.end({ output: { paused: true } });
       return { halted: true };
     }
 
     const run = await BrsPipelineRun.findById(state.runId).select("stages.fetch fetchOutput documentText").lean();
     if (run?.stages?.fetch === "done" && typeof run.fetchOutput === "string" && run.fetchOutput.length > 0) {
-      span.end({ output: { reused: true, length: run.fetchOutput.length } });
+      const span = trace.span({
+        name: "chunkAndFetch",
+        input: { reusedFromPersistence: true, documentText: state.documentText },
+      });
+      span.end({ output: { fetchOutput: run.fetchOutput } });
       return { fetchResult: run.fetchOutput };
     }
 
-    const chunks = chunkDocumentText(state.documentText);
+    const chunks = await splitBrsDocumentTextSectionWise(state.documentText);
+    const chunkPrompts = chunks.map((c) =>
+      interpolate(FETCH_AGENT_PROMPT, { documentText: c.text })
+    );
 
     // Sequential so a stop request can be honored between chunks.
     const chunkResults: string[] = [];
-    for (const chunk of chunks) {
+    for (let i = 0; i < chunks.length; i++) {
       if (await stopIfRequested(state.runId)) {
-        span.end({ output: { paused: true, chunkCount: chunks.length, completed: chunkResults.length } });
+        const span = trace.span({
+          name: "chunkAndFetch",
+          input: {
+            documentText: state.documentText,
+            chunkPrompts,
+            completedChunkIndex: i,
+          },
+        });
+        span.end({
+          output: {
+            paused: true,
+            chunkCount: chunks.length,
+            completed: chunkResults.length,
+            chunkResultsSoFar: chunkResults,
+          },
+        });
         return { halted: true };
       }
-      const prompt = interpolate(FETCH_AGENT_PROMPT, { documentText: chunk.text });
-      chunkResults.push(await callModel("fetch", prompt));
+      chunkResults.push(await callModel("fetch", chunkPrompts[i]!));
     }
 
     const mergePrompt = interpolate(CHUNK_MERGE_PROMPT, {
@@ -376,6 +447,14 @@ async function chunkAndFetch(state: PipelineStateType): Promise<Partial<Pipeline
     });
 
     let mergedFetch: string;
+    const span = trace.span({
+      name: "chunkAndFetch",
+      input: {
+        documentText: state.documentText,
+        chunkPrompts,
+        mergePrompt,
+      },
+    });
     try {
       mergedFetch = await callModel("fetch", mergePrompt);
       await updateRun(state.runId, {
@@ -393,7 +472,14 @@ async function chunkAndFetch(state: PipelineStateType): Promise<Partial<Pipeline
       });
     }
 
-    span.end({ output: { chunkCount: chunks.length } });
+    span.end({
+      output: {
+        chunkCount: chunks.length,
+        chunkResults,
+        mergePrompt,
+        fetchOutput: mergedFetch,
+      },
+    });
     return { fetchResult: mergedFetch };
   } finally {
     await langfuse.flushAsync();
@@ -402,18 +488,29 @@ async function chunkAndFetch(state: PipelineStateType): Promise<Partial<Pipeline
 
 async function devAgent(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({ name: "brs-pipeline", input: { runId: state.runId } });
-  const span = trace.span({ name: "devAgent" });
+  const trace = langfuse.trace({
+    name: "brs-pipeline",
+    input: {
+      runId: state.runId,
+      documentText: state.documentText,
+      fetchResult: state.fetchResult,
+    },
+  });
 
   try {
     if (await stopIfRequested(state.runId)) {
+      const span = trace.span({ name: "devAgent", input: { pausedCheck: true } });
       span.end({ output: { paused: true } });
       return { halted: true };
     }
 
     const run = await BrsPipelineRun.findById(state.runId).select("stages.dev devOutput").lean();
     if (run?.stages?.dev === "done" && typeof run.devOutput === "string" && run.devOutput.length > 0) {
-      span.end({ output: { reused: true, length: run.devOutput.length } });
+      const span = trace.span({
+        name: "devAgent",
+        input: { reusedFromPersistence: true, fetchResult: state.fetchResult, documentText: state.documentText },
+      });
+      span.end({ output: { devOutput: run.devOutput } });
       return { devOutput: run.devOutput };
     }
 
@@ -423,10 +520,11 @@ async function devAgent(state: PipelineStateType): Promise<Partial<PipelineState
       FETCH_AGENT_JSON_OUTPUT: state.fetchResult ?? state.documentText,
       REVIEWER_CORRECTIVES: state.correctivesDev ?? "{}",
     });
+    const span = trace.span({ name: "devAgent", input: { prompt } });
     const result = await callModel("dev", prompt);
 
     await updateRun(state.runId, { "stages.dev": "done", devOutput: result });
-    span.end({ output: { length: result.length } });
+    span.end({ output: { devOutput: result } });
     return { devOutput: result };
   } finally {
     await langfuse.flushAsync();
@@ -435,18 +533,29 @@ async function devAgent(state: PipelineStateType): Promise<Partial<PipelineState
 
 async function pmAgent(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({ name: "brs-pipeline", input: { runId: state.runId } });
-  const span = trace.span({ name: "pmAgent" });
+  const trace = langfuse.trace({
+    name: "brs-pipeline",
+    input: {
+      runId: state.runId,
+      documentText: state.documentText,
+      fetchResult: state.fetchResult,
+    },
+  });
 
   try {
     if (await stopIfRequested(state.runId)) {
+      const span = trace.span({ name: "pmAgent", input: { pausedCheck: true } });
       span.end({ output: { paused: true } });
       return { halted: true };
     }
 
     const run = await BrsPipelineRun.findById(state.runId).select("stages.pm pmOutput").lean();
     if (run?.stages?.pm === "done" && typeof run.pmOutput === "string" && run.pmOutput.length > 0) {
-      span.end({ output: { reused: true, length: run.pmOutput.length } });
+      const span = trace.span({
+        name: "pmAgent",
+        input: { reusedFromPersistence: true, fetchResult: state.fetchResult, documentText: state.documentText },
+      });
+      span.end({ output: { pmOutput: run.pmOutput } });
       return { pmOutput: run.pmOutput };
     }
 
@@ -456,10 +565,11 @@ async function pmAgent(state: PipelineStateType): Promise<Partial<PipelineStateT
       FETCH_AGENT_JSON_OUTPUT: state.fetchResult ?? state.documentText,
       REVIEWER_CORRECTIVES: state.correctivesPm ?? "{}",
     });
+    const span = trace.span({ name: "pmAgent", input: { prompt } });
     const result = await callModel("pm", prompt);
 
     await updateRun(state.runId, { "stages.pm": "done", pmOutput: result });
-    span.end({ output: { length: result.length } });
+    span.end({ output: { pmOutput: result } });
     return { pmOutput: result };
   } finally {
     await langfuse.flushAsync();
@@ -468,8 +578,28 @@ async function pmAgent(state: PipelineStateType): Promise<Partial<PipelineStateT
 
 async function reviewerAgent(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({ name: "brs-pipeline", input: { runId: state.runId } });
-  const span = trace.span({ name: "reviewerAgent" });
+  const fetchJson = state.fetchResult ?? "";
+  const devJson = state.devOutput ?? "{}";
+  const pmJson = state.pmOutput ?? "{}";
+  const trace = langfuse.trace({
+    name: "brs-pipeline",
+    input: {
+      runId: state.runId,
+      documentText: state.documentText,
+      fetchResult: fetchJson,
+      devOutput: devJson,
+      pmOutput: pmJson,
+    },
+  });
+  const prompt = interpolate(REVIEWER_AGENT_PROMPT, {
+    FETCH_AGENT_JSON: fetchJson,
+    DEV_AGENT_JSON: devJson,
+    PM_AGENT_JSON: pmJson,
+  });
+  const span = trace.span({
+    name: "reviewerAgent",
+    input: { prompt },
+  });
 
   try {
     if (await stopIfRequested(state.runId)) {
@@ -478,16 +608,6 @@ async function reviewerAgent(state: PipelineStateType): Promise<Partial<Pipeline
     }
 
     await updateRun(state.runId, { "stages.review": "running" });
-
-    const fetchJson = state.fetchResult ?? "";
-    const devJson = state.devOutput ?? "{}";
-    const pmJson = state.pmOutput ?? "{}";
-
-    const prompt = interpolate(REVIEWER_AGENT_PROMPT, {
-      FETCH_AGENT_JSON: fetchJson,
-      DEV_AGENT_JSON: devJson,
-      PM_AGENT_JSON: pmJson,
-    });
 
     const raw = await callReviewerModel(prompt);
     const parsed = parseReviewerOutput(raw);
@@ -510,6 +630,8 @@ async function reviewerAgent(state: PipelineStateType): Promise<Partial<Pipeline
 
     span.end({
       output: {
+        reviewerRaw: raw,
+        parsedReview: parsed,
         ready_for_merge: ready,
         escalatedMergeRequest: escalated,
         reviewPass: pass,
@@ -543,17 +665,27 @@ function routeAfterReviewer(
 
 async function selectiveRerun(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({ name: "brs-pipeline", input: { runId: state.runId } });
-  const span = trace.span({ name: "selectiveRerun" });
+  const trace = langfuse.trace({
+    name: "brs-pipeline",
+    input: {
+      runId: state.runId,
+      documentText: state.documentText,
+      fetchResult: state.fetchResult,
+      devOutput: state.devOutput,
+      pmOutput: state.pmOutput,
+    },
+  });
 
   try {
     if (await stopIfRequested(state.runId)) {
+      const span = trace.span({ name: "selectiveRerun", input: { pausedCheck: true } });
       span.end({ output: { paused: true } });
       return { halted: true };
     }
 
     const review = state.lastParsedReview;
     if (!review) {
+      const span = trace.span({ name: "selectiveRerun", input: { note: "missing_lastParsedReview" } });
       span.end({ output: { error: "no_review" } });
       return { rerunsAfterBlock: (state.rerunsAfterBlock ?? 0) + 1 };
     }
@@ -564,29 +696,47 @@ async function selectiveRerun(state: PipelineStateType): Promise<Partial<Pipelin
 
     const nextReruns = (state.rerunsAfterBlock ?? 0) + 1;
 
+    const devPrompt = dev
+      ? interpolate(DEV_CHECKLIST_PROMPT, {
+          FETCH_AGENT_JSON_OUTPUT: state.fetchResult ?? state.documentText,
+          REVIEWER_CORRECTIVES: correctivesDevStr,
+        })
+      : undefined;
+    const pmPrompt = pm
+      ? interpolate(PM_CHECKLIST_PROMPT, {
+          FETCH_AGENT_JSON_OUTPUT: state.fetchResult ?? state.documentText,
+          REVIEWER_CORRECTIVES: correctivesPmStr,
+        })
+      : undefined;
+
+    const span = trace.span({
+      name: "selectiveRerun",
+      input: {
+        lastParsedReview: review,
+        correctivesDev: correctivesDevStr,
+        correctivesPm: correctivesPmStr,
+        devRerun: dev,
+        pmRerun: pm,
+        devPrompt,
+        pmPrompt,
+      },
+    });
+
     const tasks: Promise<void>[] = [];
-    if (dev) {
+    if (dev && devPrompt) {
       tasks.push(
         (async () => {
           await updateRun(state.runId, { "stages.dev": "running" });
-          const prompt = interpolate(DEV_CHECKLIST_PROMPT, {
-            FETCH_AGENT_JSON_OUTPUT: state.fetchResult ?? state.documentText,
-            REVIEWER_CORRECTIVES: correctivesDevStr,
-          });
-          const result = await callModel("dev", prompt);
+          const result = await callModel("dev", devPrompt);
           await updateRun(state.runId, { "stages.dev": "done", devOutput: result });
         })()
       );
     }
-    if (pm) {
+    if (pm && pmPrompt) {
       tasks.push(
         (async () => {
           await updateRun(state.runId, { "stages.pm": "running" });
-          const prompt = interpolate(PM_CHECKLIST_PROMPT, {
-            FETCH_AGENT_JSON_OUTPUT: state.fetchResult ?? state.documentText,
-            REVIEWER_CORRECTIVES: correctivesPmStr,
-          });
-          const result = await callModel("pm", prompt);
+          const result = await callModel("pm", pmPrompt);
           await updateRun(state.runId, { "stages.pm": "done", pmOutput: result });
         })()
       );
@@ -596,7 +746,15 @@ async function selectiveRerun(state: PipelineStateType): Promise<Partial<Pipelin
 
     const run = await BrsPipelineRun.findById(state.runId).lean();
 
-    span.end({ output: { nextReruns, dev, pm } });
+    span.end({
+      output: {
+        nextReruns,
+        dev,
+        pm,
+        devOutput: run?.devOutput ?? state.devOutput,
+        pmOutput: run?.pmOutput ?? state.pmOutput,
+      },
+    });
     return {
       rerunsAfterBlock: nextReruns,
       correctivesDev: "{}",
@@ -611,18 +769,27 @@ async function selectiveRerun(state: PipelineStateType): Promise<Partial<Pipelin
 
 async function mergeAgents(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({ name: "brs-pipeline", input: { runId: state.runId } });
-  const span = trace.span({ name: "mergeAgents" });
+  const trace = langfuse.trace({
+    name: "brs-pipeline",
+    input: {
+      runId: state.runId,
+      documentText: state.documentText,
+      devOutput: state.devOutput,
+      pmOutput: state.pmOutput,
+    },
+  });
 
   try {
     if (await stopIfRequested(state.runId)) {
+      const span = trace.span({ name: "mergeAgents", input: { pausedCheck: true } });
       span.end({ output: { paused: true } });
       return { halted: true };
     }
 
     const existing = await BrsPipelineRun.findById(state.runId).select("stages.merge mergedReport status").lean();
     if (existing?.stages?.merge === "done" && typeof existing.mergedReport === "string" && existing.mergedReport.length > 0) {
-      span.end({ output: { reused: true, length: existing.mergedReport.length } });
+      const span = trace.span({ name: "mergeAgents", input: { reusedFromPersistence: true } });
+      span.end({ output: { mergedReport: existing.mergedReport } });
       return { mergedReport: existing.mergedReport };
     }
 
@@ -632,7 +799,9 @@ async function mergeAgents(state: PipelineStateType): Promise<Partial<PipelineSt
       devChecklist: state.devOutput ?? "{}",
       pmChecklist: state.pmOutput ?? "{}",
     });
+    const span = trace.span({ name: "mergeAgents", input: { prompt } });
     const result = await callModel("default", prompt);
+    const mergedReportText = formatJsonLikeOutput(result);
 
     const escalated = state.escalatedMergeRequest === true;
 
@@ -640,7 +809,7 @@ async function mergeAgents(state: PipelineStateType): Promise<Partial<PipelineSt
     if (escalated) {
       await updateRun(state.runId, {
         "stages.merge": "done",
-        mergedReport: result,
+        mergedReport: mergedReportText,
         mergeSource: "escalated_after_max_retries",
         status: "awaiting_user_decision",
         awaitingUserDecision: true,
@@ -648,7 +817,7 @@ async function mergeAgents(state: PipelineStateType): Promise<Partial<PipelineSt
     } else {
       await updateRun(state.runId, {
         "stages.merge": "done",
-        mergedReport: result,
+        mergedReport: mergedReportText,
         mergeSource: "reviewer_approved",
         status: "done",
         completedAt: new Date(),
@@ -656,28 +825,19 @@ async function mergeAgents(state: PipelineStateType): Promise<Partial<PipelineSt
       });
     }
 
-    try {
-      const vector = await embedText(result, { inputType: "document" });
-      await updateRun(state.runId, {
-        "embeddings.mergedReport": {
-          provider: "voyage",
-          model: "voyage-3.5-lite",
-          vector,
-          createdAt: new Date(),
-        },
-      });
-      span.end({ output: { length: result.length, escalated, mergedReportEmbeddingDims: vector.length } });
-    } catch (err) {
-      console.error(`Voyage embedding failed (mergedReport) for run ${state.runId}:`, err);
-      span.end({
-        output: {
-          length: result.length,
-          escalated,
-          mergedReportEmbeddingError: err instanceof Error ? err.message : String(err),
-        },
-      });
+    // Index the merged report into the dedicated `merge_report` Qdrant collection on the
+    // non-escalated path. Escalated runs wait for the user's Save decision; see decisionRoute.
+    if (!escalated) {
+      try {
+        await embedMergeReportForRun(state.runId);
+      } catch (embedErr) {
+        // Embedding must never fail the pipeline; embedMergeReportForRun already logs internally.
+        console.error(`[mergeAgents] merge embed failed for run ${state.runId}:`, embedErr);
+      }
     }
-    return { mergedReport: result };
+
+    span.end({ output: { mergedReport: mergedReportText, escalated } });
+    return { mergedReport: mergedReportText };
   } finally {
     await langfuse.flushAsync();
   }

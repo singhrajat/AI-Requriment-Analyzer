@@ -33,9 +33,10 @@ export interface IBrsPipelineRun extends Document {
   documentText?: string;
   embeddings?: {
     brs?: {
-      provider: "voyage";
-      model: "voyage-3.5-lite";
+      provider: string;
+      model: string;
       strategy: "single" | "chunked";
+      /** Legacy Voyage-era documents only; new runs index vectors in Qdrant. */
       vector?: number[];
       chunks?: Array<{
         index: number;
@@ -46,9 +47,10 @@ export interface IBrsPipelineRun extends Document {
       createdAt: Date;
     };
     mergedReport?: {
-      provider: "voyage";
-      model: "voyage-3.5-lite";
-      vector: number[];
+      provider: string;
+      model: string;
+      /** Legacy only */
+      vector?: number[];
       createdAt: Date;
     };
   };
@@ -111,8 +113,8 @@ const BrsPipelineRunSchema = new Schema<IBrsPipelineRun>(
     documentText: { type: String },
     embeddings: {
       brs: {
-        provider: { type: String, enum: ["voyage"] },
-        model: { type: String, enum: ["voyage-3.5-lite"] },
+        provider: { type: String },
+        model: { type: String },
         strategy: { type: String, enum: ["single", "chunked"] },
         vector: { type: [Number] },
         chunks: {
@@ -132,8 +134,8 @@ const BrsPipelineRunSchema = new Schema<IBrsPipelineRun>(
         createdAt: { type: Date },
       },
       mergedReport: {
-        provider: { type: String, enum: ["voyage"] },
-        model: { type: String, enum: ["voyage-3.5-lite"] },
+        provider: { type: String },
+        model: { type: String },
         vector: { type: [Number] },
         createdAt: { type: Date },
       },

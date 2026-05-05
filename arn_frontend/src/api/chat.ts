@@ -9,8 +9,14 @@ export type ChatHistoryMessage = {
 
 export type StreamChatParams = {
   message: string;
-  useDbSearch: boolean;
   history: ChatHistoryMessage[];
+  /** Optional Mongo run id; when set, restricts retrieval to a single BRS run on the server. */
+  runId?: string;
+  /**
+   * When true, RAG also searches merge-report vectors for `runId`.
+   * Omit or false for BRS-only retrieval (still scoped by runId when set).
+   */
+  includeMergeReportInRag?: boolean;
 };
 
 export type ChatCitation = {
@@ -18,6 +24,12 @@ export type ChatCitation = {
   sourceName: string;
   kind: "brs_chunk" | "brs_full" | "merged_report";
   chunkIndex?: number;
+  /** Merge-only: dotted section path. */
+  sectionPath?: string;
+  /** Merge-only: 1-based part index when a section was split into multiple parts. */
+  partIndex?: number;
+  /** Merge-only: total number of parts for the section. */
+  partCount?: number;
   score?: number;
 };
 
@@ -36,8 +48,9 @@ export async function* streamChat(params: StreamChatParams): AsyncGenerator<SseP
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
     body: JSON.stringify({
       message: params.message,
-      useDbSearch: params.useDbSearch,
       history: params.history,
+      ...(params.runId ? { runId: params.runId } : {}),
+      ...(params.includeMergeReportInRag === true ? { includeMergeReportInRag: true } : {}),
     }),
   });
 

@@ -16,14 +16,20 @@ import {
   type NodeWithScore,
   type QueryBundle,
 } from "llamaindex";
-import { getChatModel, getChatModelTelemetry, getLangfuse } from "../config/modelConfig";
-import { BrsPipelineRun } from "../models/BrsPipelineRun";
+import {
+  getChatModel,
+  getChatModelDirect,
+  getChatModelTelemetryForRoute,
+  getLangfuse,
+  getOpenAIEmbeddings,
+} from "../config/modelConfig";
 import {
   buildAugmentedUserQuery,
-  CHAT_DIRECT_SYSTEM_PROMPT,
+  CHAT_DIRECT_SMALLTALK_SYSTEM,
   CHAT_NO_INDEXED_DOCS_SYSTEM,
 } from "../prompts/chatPrompts";
-import { embedText } from "./voyageEmbeddings";
+import { shouldAnswerChatWithoutRag } from "../utils/chatGreetingGate";
+import { searchBrsSimilar } from "./qdrantBrsStore";
 
 const DEFAULT_TOP_K = 5;
 
@@ -32,26 +38,18 @@ export type ChatCitation = {
   sourceName: string;
   kind: "brs_chunk" | "brs_full" | "merged_report";
   chunkIndex?: number;
+  /** Merge-only: dotted section path (e.g. `developerAnalysis.security`). */
+  sectionPath?: string;
+  /** Merge-only: 1-based part index when a section was split into multiple parts. */
+  partIndex?: number;
+  /** Merge-only: total number of parts for the section. */
+  partCount?: number;
   score?: number;
 };
 
 export type ChatStreamEvent =
   | { type: "token"; token: string }
   | { type: "sources"; sources: ChatCitation[] };
-
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length || a.length === 0) return 0;
-  let dot = 0;
-  let na = 0;
-  let nb = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
-  }
-  if (na === 0 || nb === 0) return 0;
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
-}
 
 function queryBundleToString(bundle: QueryBundle): string {
   const q = bundle.query;
@@ -105,13 +103,81 @@ function chunkContentToString(content: unknown): string {
   return "";
 }
 
+/** OpenAI chat completion usage; merged from streamed chunks for Langfuse `usageDetails`. */
+type OpenAiCompletionUsage = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+};
+
+function pickFiniteNumber(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** Merge token usage from a LangChain / OpenAI stream chunk (last chunk often carries full usage). */
+function absorbOpenAiUsageFromChunk(chunk: unknown, sink: OpenAiCompletionUsage): void {
+  if (!chunk || typeof chunk !== "object") return;
+  const o = chunk as Record<string, unknown>;
+
+  const um = o.usage_metadata as Record<string, unknown> | undefined;
+  if (um) {
+    const pi =
+      pickFiniteNumber(um.input_tokens) ??
+      pickFiniteNumber(um.prompt_tokens);
+    const po =
+      pickFiniteNumber(um.output_tokens) ??
+      pickFiniteNumber(um.completion_tokens);
+    const tt = pickFiniteNumber(um.total_tokens);
+    if (pi !== undefined) sink.prompt_tokens = pi;
+    if (po !== undefined) sink.completion_tokens = po;
+    if (tt !== undefined) sink.total_tokens = tt;
+  }
+
+  const rm = o.response_metadata as Record<string, unknown> | undefined;
+  const tu = rm?.token_usage as Record<string, unknown> | undefined;
+  if (tu) {
+    const pi =
+      pickFiniteNumber(tu.prompt_tokens) ?? pickFiniteNumber(tu.input_tokens);
+    const po =
+      pickFiniteNumber(tu.completion_tokens) ?? pickFiniteNumber(tu.output_tokens);
+    const tt = pickFiniteNumber(tu.total_tokens);
+    if (pi !== undefined) sink.prompt_tokens = pi;
+    if (po !== undefined) sink.completion_tokens = po;
+    if (tt !== undefined) sink.total_tokens = tt;
+  }
+
+  if (
+    sink.total_tokens === undefined &&
+    sink.prompt_tokens !== undefined &&
+    sink.completion_tokens !== undefined
+  ) {
+    sink.total_tokens = sink.prompt_tokens + sink.completion_tokens;
+  }
+}
+
+/** Maps to Langfuse OpenAI-style usage for cost calculation in the UI. */
+function openAiUsageToLangfuseDetails(
+  sink: OpenAiCompletionUsage
+): Record<string, number> | undefined {
+  const { prompt_tokens: pt, completion_tokens: ct, total_tokens: tt } = sink;
+  if (pt === undefined && ct === undefined && tt === undefined) return undefined;
+  const out: Record<string, number> = {};
+  if (pt !== undefined) out.prompt_tokens = pt;
+  if (ct !== undefined) out.completion_tokens = ct;
+  if (tt !== undefined) out.total_tokens = tt;
+  else if (pt !== undefined && ct !== undefined) out.total_tokens = pt + ct;
+  return Object.keys(out).length ? out : undefined;
+}
+
 /**
  * Bridges LangChain ChatOpenAI to LlamaIndex's LLM interface for {@link getResponseSynthesizer}.
+ * When `usageAccumulator` is set, stream/invoke calls merge OpenAI token usage for Langfuse.
  */
 class LangChainOpenAILlamaIndexLLM extends BaseLLM {
   constructor(
     private readonly lc: ChatOpenAI,
-    private readonly meta: LLMMetadata
+    private readonly meta: LLMMetadata,
+    private readonly usageAccumulator?: OpenAiCompletionUsage
   ) {
     super();
   }
@@ -130,8 +196,12 @@ class LangChainOpenAILlamaIndexLLM extends BaseLLM {
     const lcMessages = toLangChainMessages(params.messages);
     if (params.stream) {
       const stream = await this.lc.stream(lcMessages);
+      const acc = this.usageAccumulator;
       async function* gen(): AsyncIterable<ChatResponseChunk<object>> {
         for await (const chunk of stream) {
+          if (acc) {
+            absorbOpenAiUsageFromChunk(chunk, acc);
+          }
           const delta = chunkContentToString(chunk.content);
           if (delta) {
             yield { raw: null, delta };
@@ -141,6 +211,9 @@ class LangChainOpenAILlamaIndexLLM extends BaseLLM {
       return gen();
     }
     const res = await this.lc.invoke(lcMessages);
+    if (this.usageAccumulator) {
+      absorbOpenAiUsageFromChunk(res, this.usageAccumulator);
+    }
     return {
       message: {
         role: "assistant",
@@ -151,184 +224,81 @@ class LangChainOpenAILlamaIndexLLM extends BaseLLM {
   }
 }
 
-type CandidateNode = {
-  node: TextNode;
-  score: number;
-};
-
-const STOPWORDS = new Set([
-  "a",
-  "an",
-  "and",
-  "are",
-  "as",
-  "at",
-  "be",
-  "but",
-  "by",
-  "can",
-  "could",
-  "did",
-  "do",
-  "does",
-  "for",
-  "from",
-  "have",
-  "how",
-  "i",
-  "if",
-  "in",
-  "into",
-  "is",
-  "it",
-  "its",
-  "me",
-  "of",
-  "on",
-  "or",
-  "our",
-  "should",
-  "show",
-  "that",
-  "the",
-  "their",
-  "then",
-  "there",
-  "they",
-  "this",
-  "to",
-  "we",
-  "what",
-  "when",
-  "where",
-  "which",
-  "who",
-  "why",
-  "will",
-  "with",
-  "you",
-  "your",
-]);
-
-function extractKeywords(text: string): string[] {
-  const words = text
-    .toLowerCase()
-    .match(/\b[a-z0-9][a-z0-9_-]{2,}\b/g);
-  if (!words) return [];
-  const uniq = new Set<string>();
-  for (const w of words) {
-    if (STOPWORDS.has(w)) continue;
-    if (w.length < 4) continue;
-    uniq.add(w);
-  }
-  return [...uniq];
-}
-
-function nodeTextMatchesKeywords(node: NodeWithScore, keywords: string[]): boolean {
-  if (keywords.length === 0) return true; // if we can't extract keywords, fall back to showing citations
-  const text = String((node.node as TextNode).text ?? "").toLowerCase();
-  if (!text) return false;
-  return keywords.some((k) => text.includes(k));
-}
-
-class MongoBrsRetriever extends BaseRetriever {
+class QdrantBrsRetriever extends BaseRetriever {
   constructor(
     private readonly topK: number,
-    private readonly langfuseTrace?: LangfuseTraceClient
+    private readonly langfuseTrace?: LangfuseTraceClient,
+    /** Optional Mongo run id; when set, restricts hits to that run in each queried collection. */
+    private readonly runId?: string,
+    /** When true, search merge-report Qdrant collection as well as BRS (both still scoped by runId when set). */
+    private readonly includeMergeReportInRag?: boolean
   ) {
     super();
   }
 
   async _retrieve(queryBundle: QueryBundle): Promise<NodeWithScore[]> {
-    const span = this.langfuseTrace?.span({ name: "retrieve" });
+    const queryText = queryBundleToString(queryBundle);
+    const span = this.langfuseTrace?.span({
+      name: "retrieve",
+      input: {
+        query: queryText,
+        runId: this.runId,
+        includeMergeReportInRag: Boolean(this.includeMergeReportInRag),
+      },
+    });
     try {
-      const out = await this.retrieveFromMongo(queryBundle);
-      span?.end({ output: { nodeCount: out.length } });
+      const out = await this.retrieveFromQdrant(queryBundle);
+      span?.end({
+        output: {
+          nodeCount: out.length,
+          nodes: out.map((n) => ({
+            score: n.score,
+            text: String((n.node as TextNode).text ?? ""),
+            metadata: (n.node as TextNode).metadata,
+          })),
+        },
+      });
       return out;
     } catch (err) {
-      span?.end();
+      span?.end({
+        output: { error: err instanceof Error ? err.message : String(err) },
+      });
       throw err;
     }
   }
 
-  private async retrieveFromMongo(queryBundle: QueryBundle): Promise<NodeWithScore[]> {
+  private async retrieveFromQdrant(queryBundle: QueryBundle): Promise<NodeWithScore[]> {
     const queryText = queryBundleToString(queryBundle).trim();
     if (!queryText) return [];
 
-    const queryVector = await embedText(queryText, { inputType: "query" });
-    if (queryVector.length === 0) return [];
+    const emb = getOpenAIEmbeddings();
+    const queryVector = await emb.embedQuery(queryText);
+    if (!queryVector.length) return [];
 
-    const runs = await BrsPipelineRun.find({
-      $or: [
-        { "embeddings.brs.vector.0": { $exists: true } },
-        { "embeddings.brs.chunks.0": { $exists: true } },
-        { "embeddings.mergedReport.vector.0": { $exists: true } },
-      ],
-    })
-      .select(
-        "_id documentText mergedReport displayName originalFileName embeddings.brs embeddings.mergedReport"
-      )
-      .lean()
-      .exec();
-
-    const candidates: CandidateNode[] = [];
-
-    for (const run of runs) {
-      const runId = String(run._id);
-      const sourceName = run.displayName || run.originalFileName || runId;
-      const docText = run.documentText ?? "";
-
-      const brs = run.embeddings?.brs;
-      if (brs?.strategy === "chunked" && brs.chunks?.length) {
-        for (const ch of brs.chunks) {
-          if (!ch.vector?.length) continue;
-          const slice = docText.slice(ch.charStart, ch.charEnd).trim();
-          if (!slice) continue;
-          const textNode = new TextNode({
-            text: slice,
-            metadata: {
-              runId,
-              sourceName,
-              kind: "brs_chunk",
-              chunkIndex: ch.index,
-            },
-          });
-          candidates.push({
-            node: textNode,
-            score: cosineSimilarity(queryVector, ch.vector),
-          });
-        }
-      } else if (brs?.vector?.length) {
-        const text = docText.trim();
-        if (text) {
-          const textNode = new TextNode({
-            text,
-            metadata: { runId, sourceName, kind: "brs_full" },
-          });
-          candidates.push({
-            node: textNode,
-            score: cosineSimilarity(queryVector, brs.vector),
-          });
-        }
-      }
-
-      const mergedVec = run.embeddings?.mergedReport?.vector;
-      const mergedText = run.mergedReport?.trim();
-      if (mergedVec?.length && mergedText) {
-        const textNode = new TextNode({
-          text: mergedText,
-          metadata: { runId, sourceName, kind: "merged_report" },
-        });
-        candidates.push({
-          node: textNode,
-          score: cosineSimilarity(queryVector, mergedVec),
-        });
-      }
+    try {
+      const hits = await searchBrsSimilar(queryVector, this.topK, {
+        ...(this.runId ? { runId: this.runId } : {}),
+        includeMergeReport: this.includeMergeReportInRag === true,
+      });
+      return hits.map((h) => ({
+        node: new TextNode({
+          text: h.payload.text,
+          metadata: {
+            runId: h.payload.runId,
+            sourceName: h.payload.sourceName,
+            kind: h.payload.kind,
+            ...(h.payload.chunkIndex !== undefined ? { chunkIndex: h.payload.chunkIndex } : {}),
+            ...(h.payload.sectionPath !== undefined ? { sectionPath: h.payload.sectionPath } : {}),
+            ...(h.payload.partIndex !== undefined ? { partIndex: h.payload.partIndex } : {}),
+            ...(h.payload.partCount !== undefined ? { partCount: h.payload.partCount } : {}),
+          },
+        }),
+        score: h.score,
+      }));
+    } catch (err) {
+      console.error("[chat] Qdrant retrieve failed:", err);
+      return [];
     }
-
-    candidates.sort((a, b) => b.score - a.score);
-    const top = candidates.slice(0, this.topK);
-    return top.map(({ node, score }) => ({ node, score }));
   }
 }
 
@@ -348,26 +318,44 @@ function citationsFromNodes(nodes: NodeWithScore[]): ChatCitation[] {
   const seen = new Set<string>();
   const out: ChatCitation[] = [];
   for (const n of nodes) {
+    // Guardrail: if storage returns an empty text payload, treat it as "not found"
+    // so the UI does not surface a clickable BRS/source that has no content.
+    const nodeText = String((n.node as TextNode).text ?? "").trim();
+    if (!nodeText) continue;
+
     const meta = (n.node as TextNode).metadata as Partial<{
       runId: string;
       sourceName: string;
-      kind: ChatCitation["kind"];
+      kind: "brs_chunk" | "brs_full" | "merge_report";
       chunkIndex?: number;
+      sectionPath?: string;
+      partIndex?: number;
+      partCount?: number;
     }>;
     const runId = meta.runId ? String(meta.runId) : "";
     const sourceName = meta.sourceName ? String(meta.sourceName) : runId;
-    const kind = meta.kind;
-    if (!runId || !sourceName || !kind) continue;
+    const rawKind = meta.kind;
+    if (!runId || !sourceName || !rawKind) continue;
 
-    const key = `${runId}::${kind}::${meta.chunkIndex ?? ""}`;
+    // Normalize storage kind ("merge_report") to the public citation kind ("merged_report").
+    const citationKind: ChatCitation["kind"] =
+      rawKind === "merge_report" ? "merged_report" : rawKind;
+
+    const key =
+      citationKind === "merged_report"
+        ? `${runId}::${citationKind}::${meta.sectionPath ?? ""}::${meta.partIndex ?? ""}`
+        : `${runId}::${citationKind}::${meta.chunkIndex ?? ""}`;
     if (seen.has(key)) continue;
     seen.add(key);
 
     out.push({
       runId,
       sourceName,
-      kind,
+      kind: citationKind,
       chunkIndex: typeof meta.chunkIndex === "number" ? meta.chunkIndex : undefined,
+      sectionPath: typeof meta.sectionPath === "string" ? meta.sectionPath : undefined,
+      partIndex: typeof meta.partIndex === "number" ? meta.partIndex : undefined,
+      partCount: typeof meta.partCount === "number" ? meta.partCount : undefined,
       score: typeof n.score === "number" ? n.score : undefined,
     });
   }
@@ -375,114 +363,267 @@ function citationsFromNodes(nodes: NodeWithScore[]): ChatCitation[] {
 }
 
 /**
- * RAG path: LlamaIndex {@link RetrieverQueryEngine} + voyage query embedding + MongoDB cosine retrieval.
+ * RAG path: LlamaIndex {@link RetrieverQueryEngine} + OpenAI query embedding + Qdrant similarity search.
+ *
+ * By default only the BRS collection is searched. When `includeMergeReportInRag` is true, the merge-report
+ * collection is searched as well; both respect optional `runId` filtering.
  */
 export async function* streamRagChat(params: {
   message: string;
   history: ChatHistoryItem[];
+  runId?: string;
+  /** When true (requires runId), retrieval includes merge-report vectors for that run. */
+  includeMergeReportInRag?: boolean;
 }): AsyncGenerator<ChatStreamEvent> {
-  const langfuse = getLangfuse();
-  const trace = langfuse.trace({
-    name: "chat",
-    input: { mode: "rag", messageLen: params.message.length },
-  });
+  const historyForModel = params.history.slice(-24);
+
+  if (shouldAnswerChatWithoutRag(params.message)) {
+    const langfuse = getLangfuse();
+    const telem = getChatModelTelemetryForRoute("direct");
+    const trace = langfuse.trace({
+      name: "chat",
+      input: {
+        mode: "direct",
+        message: params.message,
+        history: historyForModel,
+      },
+      metadata: {
+        chatRoute: "direct",
+        chosenModel: telem.modelName,
+      },
+    });
+
+    try {
+      const lc = getChatModelDirect();
+      const usageSink: OpenAiCompletionUsage = {};
+      const generation = trace.generation({
+        name: "chat_completion",
+        model: telem.modelName,
+        modelParameters: {
+          temperature: telem.temperature,
+          max_tokens: telem.maxTokens,
+        },
+        input: {
+          system: CHAT_DIRECT_SMALLTALK_SYSTEM,
+          userMessage: params.message,
+        },
+        metadata: { chatRoute: "direct", chosenModel: telem.modelName },
+      });
+      let assistantDirect = "";
+      let completionStarted = false;
+      try {
+        const stream = await lc.stream([
+          new SystemMessage(CHAT_DIRECT_SMALLTALK_SYSTEM),
+          new HumanMessage(params.message),
+        ]);
+        for await (const chunk of stream) {
+          absorbOpenAiUsageFromChunk(chunk, usageSink);
+          const delta = chunkContentToString(chunk.content);
+          if (delta) {
+            if (!completionStarted) {
+              generation.update({
+                completionStartTime: new Date(),
+              });
+              completionStarted = true;
+            }
+            assistantDirect += delta;
+            yield { type: "token", token: delta };
+          }
+        }
+      } finally {
+        generation.end({
+          output: {
+            assistantMessage: assistantDirect,
+            mode: "direct",
+          },
+          usageDetails: openAiUsageToLangfuseDetails(usageSink),
+        });
+      }
+      yield { type: "sources", sources: [] };
+      trace.update({
+        output: {
+          done: true,
+          mode: "direct",
+          assistantMessage: assistantDirect,
+          sources: [],
+          chosenModel: telem.modelName,
+        },
+      });
+      return;
+    } catch (err) {
+      trace.update({
+        output: { error: err instanceof Error ? err.message : "unknown" },
+      });
+      throw err;
+    } finally {
+      await langfuse.flushAsync();
+    }
+  }
 
   const augmented = buildAugmentedUserQuery({
     message: params.message,
     history: params.history,
     useRagPrefix: true,
   });
+  const ragTelem = getChatModelTelemetryForRoute("rag");
+  const langfuse = getLangfuse();
+  const trace = langfuse.trace({
+    name: "chat",
+    input: {
+      mode: "rag",
+      message: params.message,
+      history: historyForModel,
+      augmentedQuery: augmented,
+      runId: params.runId,
+      includeMergeReportInRag: Boolean(params.includeMergeReportInRag),
+    },
+    metadata: {
+      chatRoute: "rag",
+      chosenSynthesisModel: ragTelem.modelName,
+      ...(params.runId ? { runId: params.runId } : {}),
+      includeMergeReportInRag: Boolean(params.includeMergeReportInRag),
+    },
+  });
 
   try {
-    const retriever = new MongoBrsRetriever(DEFAULT_TOP_K, trace);
+    const retriever = new QdrantBrsRetriever(
+      DEFAULT_TOP_K,
+      trace,
+      params.runId,
+      params.includeMergeReportInRag
+    );
     const nodes = await retriever.retrieve({ query: augmented });
-    const keywords = extractKeywords(params.message);
-    const citationNodes = nodes.filter((n) => nodeTextMatchesKeywords(n, keywords));
-    const citations = citationsFromNodes(citationNodes);
+    const citations = citationsFromNodes(nodes);
 
     const lc = getChatModel();
-    const telem = getChatModelTelemetry();
-    const llmAdapter = new LangChainOpenAILlamaIndexLLM(lc, {
-      model: telem.modelName,
-      temperature: telem.temperature,
-      topP: 1,
-      maxTokens: telem.maxTokens,
-      contextWindow: 128000,
-      tokenizer: undefined,
-      structuredOutput: false,
-    });
+    const telem = getChatModelTelemetryForRoute("rag");
+    const ragLlmUsage: OpenAiCompletionUsage = {};
+    const llmAdapter = new LangChainOpenAILlamaIndexLLM(
+      lc,
+      {
+        model: telem.modelName,
+        temperature: telem.temperature,
+        topP: .7,
+        maxTokens: telem.maxTokens,
+        contextWindow: 128000,
+        tokenizer: undefined,
+        structuredOutput: false,
+      },
+      ragLlmUsage
+    );
 
     if (nodes.length === 0) {
-      const synthSpan = trace.span({ name: "synthesize", metadata: { fallback: "no_index" } });
+      const usageSink: OpenAiCompletionUsage = {};
+      const generation = trace.generation({
+        name: "chat_completion",
+        model: telem.modelName,
+        modelParameters: {
+          temperature: telem.temperature,
+          max_tokens: telem.maxTokens,
+        },
+        input: {
+          system: CHAT_NO_INDEXED_DOCS_SYSTEM,
+          userMessage: params.message,
+        },
+        metadata: { chatRoute: "rag_empty", chosenModel: telem.modelName },
+      });
+      let assistantNoIndex = "";
+      let completionStarted = false;
       try {
         const stream = await lc.stream([
           new SystemMessage(CHAT_NO_INDEXED_DOCS_SYSTEM),
           new HumanMessage(params.message),
         ]);
         for await (const chunk of stream) {
+          absorbOpenAiUsageFromChunk(chunk, usageSink);
           const delta = chunkContentToString(chunk.content);
-          if (delta) yield { type: "token", token: delta };
+          if (delta) {
+            if (!completionStarted) {
+              generation.update({
+                completionStartTime: new Date(),
+              });
+              completionStarted = true;
+            }
+            assistantNoIndex += delta;
+            yield { type: "token", token: delta };
+          }
         }
       } finally {
-        synthSpan.end();
+        generation.end({
+          output: {
+            assistantMessage: assistantNoIndex,
+            mode: "rag_empty",
+          },
+          usageDetails: openAiUsageToLangfuseDetails(usageSink),
+        });
       }
+      console.log("[chat][rag_empty] response:", assistantNoIndex);
       yield { type: "sources", sources: [] };
-      trace.update({ output: { done: true, mode: "rag_empty" } });
+      trace.update({
+        output: {
+          done: true,
+          mode: "rag_empty",
+          assistantMessage: assistantNoIndex,
+          sources: [],
+          chosenModel: telem.modelName,
+        },
+      });
       return;
     }
 
     const synthesizer = getResponseSynthesizer("compact", { llm: llmAdapter });
-    const synthesizeSpan = trace.span({ name: "synthesize" });
+    const generation = trace.generation({
+      name: "synthesize",
+      model: telem.modelName,
+      modelParameters: {
+        temperature: telem.temperature,
+        max_tokens: telem.maxTokens,
+      },
+      input: {
+        augmentedQuery: augmented,
+        contextNodes: nodes.map((n) => ({
+          score: n.score,
+          text: String((n.node as TextNode).text ?? ""),
+          metadata: (n.node as TextNode).metadata,
+        })),
+      },
+      metadata: { chatRoute: "rag", chosenModel: telem.modelName },
+    });
+    let assistantRag = "";
+    let completionStarted = false;
     const responseStream = await synthesizer.synthesize({ query: augmented, nodes }, true);
     try {
       for await (const token of streamEngineResponse(responseStream)) {
+        if (!completionStarted) {
+          generation.update({
+            completionStartTime: new Date(),
+          });
+          completionStarted = true;
+        }
+        assistantRag += token;
         yield { type: "token", token };
       }
     } finally {
-      synthesizeSpan.end();
+      generation.end({
+        output: {
+          assistantMessage: assistantRag,
+          mode: "rag",
+        },
+        usageDetails: openAiUsageToLangfuseDetails(ragLlmUsage),
+      });
     }
+    console.log("[chat][rag] response:", assistantRag);
+    console.log("[chat][rag] sources:", citations);
     yield { type: "sources", sources: citations };
-    trace.update({ output: { done: true, mode: "rag" } });
-  } catch (err) {
     trace.update({
-      output: { error: err instanceof Error ? err.message : "unknown" },
+      output: {
+        done: true,
+        mode: "rag",
+        assistantMessage: assistantRag,
+        sources: citations,
+        chosenModel: telem.modelName,
+      },
     });
-    throw err;
-  } finally {
-    await langfuse.flushAsync();
-  }
-}
-
-/**
- * Direct LLM path (no vector retrieval).
- */
-export async function* streamDirectChat(params: {
-  message: string;
-  history: ChatHistoryItem[];
-}): AsyncGenerator<ChatStreamEvent> {
-  const langfuse = getLangfuse();
-  const trace = langfuse.trace({
-    name: "chat",
-    input: { mode: "direct", messageLen: params.message.length },
-  });
-
-  try {
-    const lc = getChatModel();
-    const messages: BaseMessage[] = [new SystemMessage(CHAT_DIRECT_SYSTEM_PROMPT)];
-    for (const h of params.history.slice(-24)) {
-      if (h.role === "system") messages.push(new SystemMessage(h.content));
-      else if (h.role === "assistant") messages.push(new AIMessage(h.content));
-      else messages.push(new HumanMessage(h.content));
-    }
-    messages.push(new HumanMessage(params.message));
-
-    const stream = await lc.stream(messages);
-    for await (const chunk of stream) {
-      const delta = chunkContentToString(chunk.content);
-      if (delta) yield { type: "token", token: delta };
-    }
-    yield { type: "sources", sources: [] };
-    trace.update({ output: { done: true, mode: "direct" } });
   } catch (err) {
     trace.update({
       output: { error: err instanceof Error ? err.message : "unknown" },

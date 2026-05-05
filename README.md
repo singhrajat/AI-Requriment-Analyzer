@@ -26,8 +26,8 @@
 
 ARN automates the tedious first pass of analyzing a BRS document. A product manager or developer uploads a `.pdf`, `.docx`, `.doc`, or `.txt` requirements document. The system then:
 
-1. Extracts and chunks the document text.
-2. Embeds it with Voyage AI and stores the vectors in MongoDB.
+1. Extracts and chunks the document text (LangChain `RecursiveCharacterTextSplitter`).
+2. Embeds it with OpenAI and upserts vectors into **Qdrant** (metadata in MongoDB).
 3. Runs a **LangGraph state machine** with specialized OpenAI agents — a **Fetch agent**, a **Developer agent**, a **PM agent**, and a **Reviewer agent** — in the correct dependency order, with automatic retry logic.
 4. Produces a merged, structured report that can be exported to `.docx`.
 5. Makes all past runs queryable through a **streaming RAG chat** interface backed by vector similarity search.
@@ -60,9 +60,13 @@ ARN automates the tedious first pass of analyzing a BRS document. A product mana
                                          │
                           ┌──────────────▼──────────────┐
                           │  MongoDB (Mongoose)           │
-                          │  - Run documents              │
-                          │  - Voyage AI embeddings       │
+                          │  - Run documents + metadata   │
                           │  - Stage outputs & history    │
+                          └──────────────┬───────────────┘
+                                         │
+                          ┌──────────────▼──────────────┐
+                          │  Qdrant (vector store)      │
+                          │  OpenAI text-embedding-3      │
                           └──────────────┬───────────────┘
                                          │
                           ┌──────────────▼──────────────┐
@@ -80,8 +84,9 @@ ARN automates the tedious first pass of analyzing a BRS document. A product mana
 | **Backend runtime** | Node.js ≥ 20, TypeScript, Express |
 | **AI orchestration** | LangChain, LangGraph (state machine) |
 | **LLM** | OpenAI (GPT-4o, GPT-4.1, o4-mini per role) |
-| **Embeddings** | Voyage AI (`voyage-3.5-lite`) via MongoDB AI Embeddings API |
-| **RAG** | LlamaIndex (`getResponseSynthesizer`), MongoDB vector retrieval |
+| **Embeddings** | OpenAI (`OPENAI_EMBEDDING_MODEL`, e.g. `text-embedding-3-large`) |
+| **Vector store** | Qdrant (cosine similarity; chunk text in payload) |
+| **RAG** | LlamaIndex (`getResponseSynthesizer`), Qdrant retrieval |
 | **Observability** | Langfuse (tracing per pipeline span) |
 | **Database** | MongoDB / Mongoose |
 | **Schema validation** | Zod |
@@ -97,7 +102,7 @@ ARN automates the tedious first pass of analyzing a BRS document. A product mana
 ## Features
 
 - **Multi-format document ingestion** — PDF, DOCX, DOC, TXT
-- **Adaptive chunking** — automatically switches between single-pass ("small") and chunk-based ("large") pipelines based on a configurable token threshold
+- **Adaptive chunking** — automatically switches between single-pass ("small") and chunk-based ("large") pipelines based on a configurable token threshold; large docs use LangChain recursive splitting (`CHUNK_SIZE` / `CHUNK_OVERLAP`)
 - **Role-based agents** — separate OpenAI models for Fetch, Developer, PM, and Reviewer roles, each configurable independently via env
 - **Reviewer with retry loops** — the Reviewer agent validates outputs with a Zod schema; blocking issues trigger a selective rerun (up to 2 iterations) before an escalation flag is set
 - **Human-in-the-loop escalation** — runs that exceed retry limits enter `awaiting_user_decision` status; users can `save` or `discard` the merged result via the UI
@@ -136,11 +141,11 @@ AI-Requirement-Analyzer/
 │   │       ├── brsPipelineGraph.ts    # LangGraph state machine (core)
 │   │       ├── brsRunDocxExport.ts    # DOCX export builder
 │   │       ├── brsStructuredOutputDocx.ts
-│   │       ├── chatService.ts         # RAG + direct chat, MongoBrsRetriever
-│   │       ├── chunkDocumentText.ts   # Section/paragraph-aware chunking
+│   │       ├── chatService.ts         # RAG + direct chat, Qdrant retriever
+│   │       ├── brsRecursiveChunk.ts   # LangChain RecursiveCharacterTextSplitter
+│   │       ├── qdrantBrsStore.ts      # Qdrant upsert / search / delete by run
 │   │       ├── extractDocumentText.ts # PDF/DOCX/DOC/TXT → plain text
-│   │       ├── tokenCounter.ts        # tiktoken helpers + threshold check
-│   │       └── voyageEmbeddings.ts    # Voyage AI HTTP client + retries
+│   │       └── tokenCounter.ts        # tiktoken helpers + threshold check
 │   ├── .env.example
 │   ├── package.json
 │   └── tsconfig.json
@@ -200,7 +205,7 @@ reviewerAgent
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/stream` | Start streaming chat; body `{ message, mode: "rag" | "direct" }`; response is `text/event-stream` |
+| `POST` | `/` | Start streaming chat; body `{ message, history? }`; always retrieves from the BRS vector index then streams the model; SSE `text/event-stream` with `token`, `sources`, and `done` events |
 
 ---
 
@@ -211,7 +216,7 @@ reviewerAgent
 - Node.js ≥ 20
 - MongoDB (local or Atlas)
 - OpenAI API key
-- Voyage AI API key
+- Qdrant reachable at `QDRANT_URL` (e.g. local Docker: `docker run -p 6333:6333 qdrant/qdrant`)
 - (Optional) Langfuse account for tracing
 
 ### Backend Setup
@@ -285,10 +290,13 @@ OPENAI_BRS_REVIEWER_MODEL=o4-mini   # Reasoning model for reviewer
 
 # BRS pipeline tuning
 BRS_SMALL_INPUT_TOKEN_THRESHOLD=4000
+CHUNK_SIZE=1500
+CHUNK_OVERLAP=200
 
-# Voyage AI embeddings (required)
-VOYAGE_API_KEY=sk-...
-VOYAGE_EMBED_MODEL=voyage-3.5-lite
+# OpenAI embeddings + Qdrant (required for indexing / RAG)
+OPENAI_EMBEDDING_MODEL=text-embedding-3-large
+QDRANT_URL=http://127.0.0.1:6333
+QDRANT_COLLECTION_NAME=arn_brs
 
 # Langfuse tracing (optional)
 LANGFUSE_HOST=https://cloud.langfuse.com
@@ -315,6 +323,8 @@ VITE_API_BASE_URL=http://localhost:3000
 
 **Human-in-the-loop escalation** — rather than silently accepting low-confidence merges, the system flags escalated runs and gates the final report behind an explicit user `save / discard` decision.
 
-**Voyage + MongoDB embeddings** — storing embeddings directly on the run document (no separate vector store) keeps the architecture simple while still enabling full cosine-similarity RAG retrieval across all past runs.
+**OpenAI + Qdrant** — document and merged-report passages are embedded with `OPENAI_EMBEDDING_MODEL` and stored in Qdrant with full text in the payload for retrieval; MongoDB keeps run metadata only.
+
+**Legacy runs** — documents created before this stack used in-Mongo Voyage vectors only; they are **not** searchable via Qdrant until you re-process those runs or run a one-off re-index that re-embeds `documentText` / `mergedReport` into the collection.
 
 **Langfuse observability** — every node emits a span with model, prompt, and latency data, making it easy to audit token usage, cost, and failure modes in production.
