@@ -17,13 +17,3 @@ export function countTokens(text: string): number {
     return Math.ceil(text.split(/\s+/).length * 1.33);
   }
 }
-
-/**
- * Returns true if the input text fits within the given token threshold.
- * The threshold is read from the BRS_SMALL_INPUT_TOKEN_THRESHOLD env var,
- * defaulting to 4000 tokens.
- */
-export function isSmallInput(text: string, threshold?: number): boolean {
-  const limit = threshold ?? Number(process.env.BRS_SMALL_INPUT_TOKEN_THRESHOLD ?? "4000");
-  return countTokens(text) <= limit;
-}

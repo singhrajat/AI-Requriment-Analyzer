@@ -1,15 +1,18 @@
 import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
 import { HumanMessage } from "@langchain/core/messages";
+import { createHash } from "node:crypto";
+import type { LangfuseTraceClient } from "langfuse";
 import { BrsPipelineRun } from "../models/BrsPipelineRun";
 import {
   getChatModelForRole,
   getChatModelIdForRole,
+  getChatModelTelemetryForRole,
   getLangfuse,
   getOpenAIEmbeddings,
   getOpenAiEmbeddingModelId,
   getReviewerChatModel,
+  getReviewerModelTelemetry,
 } from "../config/modelConfig";
-import { isSmallInput } from "./tokenCounter";
 import { splitBrsDocumentTextSectionWise } from "./brsRecursiveChunk";
 import { brsPointId, upsertBrsVectors } from "./qdrantBrsStore";
 import { embedMergeReportForRun } from "./mergeReportRagChunks";
@@ -28,6 +31,7 @@ import {
   type ParsedBrsReview,
 } from "../schemas/brsReviewerOutput";
 import { formatJsonLikeOutput } from "../utils/parseJsonLikeOutput";
+import { emitBrsRunChanged } from "./brsRunEvents";
 
 // ── State ──────────────────────────────────────────────────────────────────────
 
@@ -102,6 +106,106 @@ type PipelineStateType = typeof PipelineState.State;
 
 async function updateRun(runId: string, fields: Record<string, unknown>) {
   await BrsPipelineRun.findByIdAndUpdate(runId, { $set: fields });
+  emitBrsRunChanged(runId, Object.keys(fields));
+}
+
+type OpenAiCompletionUsage = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+};
+
+function pickFiniteNumber(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+function absorbOpenAiUsageFromLangChainResult(result: unknown, sink: OpenAiCompletionUsage): void {
+  if (!result || typeof result !== "object") return;
+  const o = result as Record<string, unknown>;
+
+  const um = o.usage_metadata as Record<string, unknown> | undefined;
+  if (um) {
+    const pi = pickFiniteNumber(um.input_tokens) ?? pickFiniteNumber(um.prompt_tokens);
+    const po = pickFiniteNumber(um.output_tokens) ?? pickFiniteNumber(um.completion_tokens);
+    const tt = pickFiniteNumber(um.total_tokens);
+    if (pi !== undefined) sink.prompt_tokens = pi;
+    if (po !== undefined) sink.completion_tokens = po;
+    if (tt !== undefined) sink.total_tokens = tt;
+  }
+
+  const rm = o.response_metadata as Record<string, unknown> | undefined;
+  const tu = rm?.token_usage as Record<string, unknown> | undefined;
+  if (tu) {
+    const pi = pickFiniteNumber(tu.prompt_tokens) ?? pickFiniteNumber(tu.input_tokens);
+    const po = pickFiniteNumber(tu.completion_tokens) ?? pickFiniteNumber(tu.output_tokens);
+    const tt = pickFiniteNumber(tu.total_tokens);
+    if (pi !== undefined) sink.prompt_tokens = pi;
+    if (po !== undefined) sink.completion_tokens = po;
+    if (tt !== undefined) sink.total_tokens = tt;
+  }
+
+  if (
+    sink.total_tokens === undefined &&
+    sink.prompt_tokens !== undefined &&
+    sink.completion_tokens !== undefined
+  ) {
+    sink.total_tokens = sink.prompt_tokens + sink.completion_tokens;
+  }
+}
+
+function openAiUsageToLangfuseDetails(
+  sink: OpenAiCompletionUsage
+): Record<string, number> | undefined {
+  const { prompt_tokens: pt, completion_tokens: ct, total_tokens: tt } = sink;
+  if (pt === undefined && ct === undefined && tt === undefined) return undefined;
+  const out: Record<string, number> = {};
+  if (pt !== undefined) out.prompt_tokens = pt;
+  if (ct !== undefined) out.completion_tokens = ct;
+  if (tt !== undefined) out.total_tokens = tt;
+  else if (pt !== undefined && ct !== undefined) out.total_tokens = pt + ct;
+  return Object.keys(out).length ? out : undefined;
+}
+
+function sha256Hex(s: string): string {
+  return createHash("sha256").update(s).digest("hex");
+}
+
+async function getOrCreatePipelineTrace(runId: string) {
+  const langfuse = getLangfuse();
+  const run = await BrsPipelineRun.findById(runId).select("langfuseTraceId langfuseHost").lean();
+  const reviewerTelem = getReviewerModelTelemetry();
+  const modelRouting = {
+    default: getChatModelIdForRole("default"),
+    fetch: getChatModelIdForRole("fetch"),
+    dev: getChatModelIdForRole("dev"),
+    pm: getChatModelIdForRole("pm"),
+    reviewer: reviewerTelem.modelName,
+  };
+
+  if (run?.langfuseTraceId) {
+    return langfuse.trace({
+      id: run.langfuseTraceId,
+      name: "brs-pipeline",
+      metadata: { runId, modelRouting },
+    });
+  }
+
+  const trace = langfuse.trace({
+    name: "brs-pipeline",
+    metadata: { runId, modelRouting },
+  });
+
+  // Persist correlation so subsequent nodes reuse this same trace.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const traceId = (trace as any).id as string | undefined;
+  if (traceId) {
+    await updateRun(runId, {
+      langfuseTraceId: traceId,
+      ...(process.env.LANGFUSE_HOST ? { langfuseHost: process.env.LANGFUSE_HOST } : {}),
+    });
+  }
+
+  return trace;
 }
 
 async function isStopRequested(runId: string): Promise<boolean> {
@@ -141,22 +245,115 @@ function interpolate(template: string, vars: Record<string, string>): string {
   return template.replace(/\{(\w+)\}/g, (_, key) => vars[key] ?? "");
 }
 
-async function callModel(role: "default" | "fetch" | "dev" | "pm", prompt: string): Promise<string> {
+async function callModel(args: {
+  trace: LangfuseTraceClient;
+  role: "default" | "fetch" | "dev" | "pm";
+  step: string;
+  prompt: string;
+  metadata?: Record<string, unknown>;
+}): Promise<string> {
+  const { trace, role, step, prompt, metadata } = args;
   const model = getChatModelForRole(role);
-  // Keep a lightweight audit trail in logs (Langfuse tracing already captures spans).
+  const telem = getChatModelTelemetryForRole(role);
+
+  // Keep a lightweight audit trail in logs (Langfuse tracing already captures spans + generations).
   console.info(`[brsPipelineGraph] role=${role} model=${getChatModelIdForRole(role)}`);
-  const response = await model.invoke([new HumanMessage(prompt)]);
-  return typeof response.content === "string"
-    ? response.content
-    : JSON.stringify(response.content);
+
+  const usage: OpenAiCompletionUsage = {};
+  const generation = trace.generation({
+    name: step,
+    model: telem.modelName,
+    modelParameters: {
+      temperature: telem.temperature,
+      max_tokens: telem.maxTokens,
+    },
+    input: undefined,
+    metadata: {
+      role,
+      promptChars: prompt.length,
+      promptSha256: sha256Hex(prompt),
+      ...(metadata ?? {}),
+    },
+  });
+
+  let response: unknown;
+  try {
+    response = await model.invoke([new HumanMessage(prompt)]);
+    absorbOpenAiUsageFromLangChainResult(response, usage);
+  } finally {
+    const text =
+      response && typeof response === "object" && "content" in (response as any)
+        ? (response as any).content
+        : "";
+    const contentStr =
+      typeof text === "string" ? text : JSON.stringify(text ?? "");
+    generation.end({
+      output: {
+        outputChars: contentStr.length,
+        outputSha256: sha256Hex(contentStr),
+      },
+      usageDetails: openAiUsageToLangfuseDetails(usage),
+    });
+  }
+
+  const content =
+    response && typeof response === "object" && "content" in (response as any)
+      ? (response as any).content
+      : "";
+  return typeof content === "string" ? content : JSON.stringify(content);
 }
 
-async function callReviewerModel(prompt: string): Promise<string> {
+async function callReviewerModel(args: {
+  trace: LangfuseTraceClient;
+  step: string;
+  prompt: string;
+  metadata?: Record<string, unknown>;
+}): Promise<string> {
+  const { trace, step, prompt, metadata } = args;
   const model = getReviewerChatModel();
-  const response = await model.invoke([new HumanMessage(prompt)]);
-  return typeof response.content === "string"
-    ? response.content
-    : JSON.stringify(response.content);
+  const telem = getReviewerModelTelemetry();
+  const usage: OpenAiCompletionUsage = {};
+  const generation = trace.generation({
+    name: step,
+    model: telem.modelName,
+    modelParameters: {
+      temperature: telem.temperature,
+      max_tokens: telem.maxTokens,
+    },
+    input: undefined,
+    metadata: {
+      role: "reviewer",
+      promptChars: prompt.length,
+      promptSha256: sha256Hex(prompt),
+      ...(metadata ?? {}),
+    },
+  });
+
+  let response: unknown;
+  try {
+    response = await model.invoke([new HumanMessage(prompt)]);
+    absorbOpenAiUsageFromLangChainResult(response, usage);
+  } finally {
+    const text =
+      response && typeof response === "object" && "content" in (response as any)
+        ? (response as any).content
+        : "";
+    const contentStr =
+      typeof text === "string" ? text : JSON.stringify(text ?? "");
+    generation.end({
+      output: {
+        outputChars: contentStr.length,
+        outputSha256: sha256Hex(contentStr),
+      },
+      usageDetails: openAiUsageToLangfuseDetails(usage),
+    });
+  }
+
+  const content =
+    response && typeof response === "object" && "content" in (response as any)
+      ? (response as any).content
+      : "";
+  return typeof content === "string" ? content : JSON.stringify(content);
 }
 
 function safeParseJson(text: string): unknown {
@@ -196,13 +393,21 @@ function buildCorrectivesForPm(review: ParsedBrsReview): string {
 
 async function embedAndMeasure(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({
-    name: "brs-pipeline",
-    input: { runId: state.runId, documentText: state.documentText },
+  const trace = await getOrCreatePipelineTrace(state.runId);
+  trace.update({
+    metadata: {
+      runId: state.runId,
+      documentChars: state.documentText.length,
+      documentSha256: sha256Hex(state.documentText),
+    },
   });
   const span = trace.span({
     name: "embedAndMeasure",
-    input: { runId: state.runId, documentText: state.documentText },
+    input: {
+      runId: state.runId,
+      documentChars: state.documentText.length,
+      documentSha256: sha256Hex(state.documentText),
+    },
   });
 
   try {
@@ -231,94 +436,72 @@ async function embedAndMeasure(state: PipelineStateType): Promise<Partial<Pipeli
 
     await updateRun(state.runId, { status: "running", "stages.fetch": "running" });
 
-    const small = isSmallInput(state.documentText);
-    const inputSizeClass: "small" | "large" = small ? "small" : "large";
-    const chunks = small ? [] : await splitBrsDocumentTextSectionWise(state.documentText);
-    const chunkCount = small ? 0 : chunks.length;
+    /** All runs: section-wise + recursive chunking only (no single-vector brs_full path). */
+    const inputSizeClass: "small" | "large" = "large";
+    let chunks = await splitBrsDocumentTextSectionWise(state.documentText);
+    if (chunks.length === 0) {
+      const trimmed = state.documentText.trim();
+      chunks = trimmed ? [{ text: trimmed, index: 0 }] : [{ text: "(empty document)", index: 0 }];
+    }
+    const chunkCount = chunks.length;
 
+    const embedModel = getOpenAiEmbeddingModelId();
     await updateRun(state.runId, { inputSizeClass, chunkCount, documentText: state.documentText });
+    trace.update({
+      metadata: {
+        inputSizeClass,
+        chunkCount,
+        brsEmbeddingModel: embedModel,
+      },
+    });
 
     const meta = await BrsPipelineRun.findById(state.runId).select("displayName originalFileName").lean();
     const sourceName = meta?.displayName || meta?.originalFileName || state.runId;
-    const embedModel = getOpenAiEmbeddingModelId();
 
     try {
       const embeddings = getOpenAIEmbeddings();
-      if (small) {
-        const trimmed = state.documentText.trim();
-        const batchVec = await embeddings.embedDocuments([trimmed]);
-        const vector = batchVec[0];
-        await upsertBrsVectors([
-          {
-            id: brsPointId(state.runId, "brs_full"),
-            vector,
-            payload: {
-              runId: state.runId,
-              sourceName,
-              kind: "brs_full",
-              text: trimmed,
-            },
-          },
-        ]);
-        await updateRun(state.runId, {
-          "embeddings.brs": {
-            provider: "openai",
-            model: embedModel,
-            strategy: "single",
-            createdAt: new Date(),
-          },
-        });
-        span.end({
-          output: {
-            inputSizeClass,
-            chunkCount,
-            brsEmbedding: { strategy: "single", dims: vector.length },
-          },
-        });
-      } else {
-        const texts = chunks.map((c) => c.text);
-        const vectors = await embeddings.embedDocuments(texts);
+      const texts = chunks.map((c) => c.text);
+      const vectors = await embeddings.embedDocuments(texts);
 
-        const points = chunks.map((c, i) => ({
-          id: brsPointId(state.runId, "brs_chunk", c.index),
-          vector: vectors[i],
-          payload: {
-            runId: state.runId,
-            sourceName,
-            kind: "brs_chunk" as const,
-            chunkIndex: c.index,
-            text: c.text,
-            sectionNumber: c.sectionNumber,
-            sectionTitle: c.sectionTitle,
-            headingPath: c.headingPath,
-            partIndex: c.partIndex,
-            partCount: c.partCount,
-          },
-        }));
+      const points = chunks.map((c, i) => ({
+        id: brsPointId(state.runId, "brs_chunk", c.index),
+        vector: vectors[i]!,
+        payload: {
+          runId: state.runId,
+          sourceName,
+          kind: "brs_chunk" as const,
+          chunkIndex: c.index,
+          text: c.text,
+          sectionNumber: c.sectionNumber,
+          sectionTitle: c.sectionTitle,
+          headingPath: c.headingPath,
+          partIndex: c.partIndex,
+          partCount: c.partCount,
+        },
+      }));
 
-        await upsertBrsVectors(points);
+      await upsertBrsVectors(points);
 
-        await updateRun(state.runId, {
-          "embeddings.brs": {
-            provider: "openai",
-            model: embedModel,
+      await updateRun(state.runId, {
+        "embeddings.brs": {
+          provider: "openai",
+          model: embedModel,
+          strategy: "chunked",
+          createdAt: new Date(),
+        },
+      });
+
+      span.end({
+        output: {
+          inputSizeClass,
+          chunkCount,
+          brsEmbedding: {
             strategy: "chunked",
-            createdAt: new Date(),
+            chunks: chunks.length,
+            dims: vectors[0]?.length ?? 0,
           },
-        });
-
-        span.end({
-          output: {
-            inputSizeClass,
-            chunkCount,
-            brsEmbedding: {
-              strategy: "chunked",
-              chunks: chunks.length,
-              dims: vectors[0]?.length ?? 0,
-            },
-          },
-        });
-      }
+        },
+      });
     } catch (err) {
       console.error(`OpenAI/Qdrant embedding failed for run ${state.runId}:`, err);
       span.end({
@@ -336,56 +519,14 @@ async function embedAndMeasure(state: PipelineStateType): Promise<Partial<Pipeli
   }
 }
 
-function routeBySize(state: PipelineStateType): "fetchSmall" | "chunkAndFetch" | "end" {
+function routeAfterEmbed(state: PipelineStateType): "chunkAndFetch" | "end" {
   if (state.halted) return "end";
-  return state.inputSizeClass === "small" ? "fetchSmall" : "chunkAndFetch";
-}
-
-async function fetchSmall(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
-  const langfuse = getLangfuse();
-  const trace = langfuse.trace({
-    name: "brs-pipeline",
-    input: { runId: state.runId, documentText: state.documentText },
-  });
-
-  try {
-    if (await stopIfRequested(state.runId)) {
-      const span = trace.span({ name: "fetchSmall", input: { pausedCheck: true } });
-      span.end({ output: { paused: true } });
-      return { halted: true };
-    }
-
-    const run = await BrsPipelineRun.findById(state.runId).select("stages.fetch fetchOutput documentText").lean();
-    if (run?.stages?.fetch === "done" && typeof run.fetchOutput === "string" && run.fetchOutput.length > 0) {
-      const span = trace.span({
-        name: "fetchSmall",
-        input: { reusedFromPersistence: true, documentText: state.documentText },
-      });
-      span.end({ output: { fetchOutput: run.fetchOutput } });
-      return { fetchResult: run.fetchOutput };
-    }
-
-    const prompt = interpolate(FETCH_AGENT_PROMPT, { documentText: state.documentText });
-    const span = trace.span({ name: "fetchSmall", input: { prompt } });
-    const result = await callModel("fetch", prompt);
-
-    await updateRun(state.runId, {
-      "stages.fetch": "done",
-      fetchOutput: result,
-    });
-    span.end({ output: { fetchOutput: result } });
-    return { fetchResult: result };
-  } finally {
-    await langfuse.flushAsync();
-  }
+  return "chunkAndFetch";
 }
 
 async function chunkAndFetch(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({
-    name: "brs-pipeline",
-    input: { runId: state.runId, documentText: state.documentText },
-  });
+  const trace = await getOrCreatePipelineTrace(state.runId);
 
   try {
     if (await stopIfRequested(state.runId)) {
@@ -404,7 +545,11 @@ async function chunkAndFetch(state: PipelineStateType): Promise<Partial<Pipeline
       return { fetchResult: run.fetchOutput };
     }
 
-    const chunks = await splitBrsDocumentTextSectionWise(state.documentText);
+    let chunks = await splitBrsDocumentTextSectionWise(state.documentText);
+    if (chunks.length === 0) {
+      const trimmed = state.documentText.trim();
+      chunks = trimmed ? [{ text: trimmed, index: 0 }] : [{ text: "(empty document)", index: 0 }];
+    }
     const chunkPrompts = chunks.map((c) =>
       interpolate(FETCH_AGENT_PROMPT, { documentText: c.text })
     );
@@ -416,8 +561,9 @@ async function chunkAndFetch(state: PipelineStateType): Promise<Partial<Pipeline
         const span = trace.span({
           name: "chunkAndFetch",
           input: {
-            documentText: state.documentText,
-            chunkPrompts,
+            documentChars: state.documentText.length,
+            documentSha256: sha256Hex(state.documentText),
+            chunkCount: chunks.length,
             completedChunkIndex: i,
           },
         });
@@ -426,12 +572,20 @@ async function chunkAndFetch(state: PipelineStateType): Promise<Partial<Pipeline
             paused: true,
             chunkCount: chunks.length,
             completed: chunkResults.length,
-            chunkResultsSoFar: chunkResults,
+            completedChunkResults: chunkResults.length,
           },
         });
         return { halted: true };
       }
-      chunkResults.push(await callModel("fetch", chunkPrompts[i]!));
+      chunkResults.push(
+        await callModel({
+          trace,
+          role: "fetch",
+          step: "fetch_chunk",
+          prompt: chunkPrompts[i]!,
+          metadata: { chunkIndex: chunks[i]!.index },
+        })
+      );
     }
 
     const mergePrompt = interpolate(CHUNK_MERGE_PROMPT, {
@@ -450,13 +604,21 @@ async function chunkAndFetch(state: PipelineStateType): Promise<Partial<Pipeline
     const span = trace.span({
       name: "chunkAndFetch",
       input: {
-        documentText: state.documentText,
-        chunkPrompts,
-        mergePrompt,
+        documentChars: state.documentText.length,
+        documentSha256: sha256Hex(state.documentText),
+        chunkCount: chunks.length,
+        mergePromptChars: mergePrompt.length,
+        mergePromptSha256: sha256Hex(mergePrompt),
       },
     });
     try {
-      mergedFetch = await callModel("fetch", mergePrompt);
+      mergedFetch = await callModel({
+        trace,
+        role: "fetch",
+        step: "fetch_merge",
+        prompt: mergePrompt,
+        metadata: { chunkCount: chunks.length },
+      });
       await updateRun(state.runId, {
         "stages.fetch": "done",
         chunkMergeStatus: "ok",
@@ -475,9 +637,9 @@ async function chunkAndFetch(state: PipelineStateType): Promise<Partial<Pipeline
     span.end({
       output: {
         chunkCount: chunks.length,
-        chunkResults,
-        mergePrompt,
-        fetchOutput: mergedFetch,
+        chunkResultsCount: chunkResults.length,
+        fetchOutputChars: mergedFetch.length,
+        fetchOutputSha256: sha256Hex(mergedFetch),
       },
     });
     return { fetchResult: mergedFetch };
@@ -488,14 +650,7 @@ async function chunkAndFetch(state: PipelineStateType): Promise<Partial<Pipeline
 
 async function devAgent(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({
-    name: "brs-pipeline",
-    input: {
-      runId: state.runId,
-      documentText: state.documentText,
-      fetchResult: state.fetchResult,
-    },
-  });
+  const trace = await getOrCreatePipelineTrace(state.runId);
 
   try {
     if (await stopIfRequested(state.runId)) {
@@ -520,11 +675,21 @@ async function devAgent(state: PipelineStateType): Promise<Partial<PipelineState
       FETCH_AGENT_JSON_OUTPUT: state.fetchResult ?? state.documentText,
       REVIEWER_CORRECTIVES: state.correctivesDev ?? "{}",
     });
-    const span = trace.span({ name: "devAgent", input: { prompt } });
-    const result = await callModel("dev", prompt);
+    const span = trace.span({
+      name: "devAgent",
+      input: { promptChars: prompt.length, promptSha256: sha256Hex(prompt) },
+    });
+    const result = await callModel({
+      trace,
+      role: "dev",
+      step: "dev_agent",
+      prompt,
+    });
 
     await updateRun(state.runId, { "stages.dev": "done", devOutput: result });
-    span.end({ output: { devOutput: result } });
+    span.end({
+      output: { devOutputChars: result.length, devOutputSha256: sha256Hex(result) },
+    });
     return { devOutput: result };
   } finally {
     await langfuse.flushAsync();
@@ -533,14 +698,7 @@ async function devAgent(state: PipelineStateType): Promise<Partial<PipelineState
 
 async function pmAgent(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({
-    name: "brs-pipeline",
-    input: {
-      runId: state.runId,
-      documentText: state.documentText,
-      fetchResult: state.fetchResult,
-    },
-  });
+  const trace = await getOrCreatePipelineTrace(state.runId);
 
   try {
     if (await stopIfRequested(state.runId)) {
@@ -565,11 +723,19 @@ async function pmAgent(state: PipelineStateType): Promise<Partial<PipelineStateT
       FETCH_AGENT_JSON_OUTPUT: state.fetchResult ?? state.documentText,
       REVIEWER_CORRECTIVES: state.correctivesPm ?? "{}",
     });
-    const span = trace.span({ name: "pmAgent", input: { prompt } });
-    const result = await callModel("pm", prompt);
+    const span = trace.span({
+      name: "pmAgent",
+      input: { promptChars: prompt.length, promptSha256: sha256Hex(prompt) },
+    });
+    const result = await callModel({
+      trace,
+      role: "pm",
+      step: "pm_agent",
+      prompt,
+    });
 
     await updateRun(state.runId, { "stages.pm": "done", pmOutput: result });
-    span.end({ output: { pmOutput: result } });
+    span.end({ output: { pmOutputChars: result.length, pmOutputSha256: sha256Hex(result) } });
     return { pmOutput: result };
   } finally {
     await langfuse.flushAsync();
@@ -581,16 +747,7 @@ async function reviewerAgent(state: PipelineStateType): Promise<Partial<Pipeline
   const fetchJson = state.fetchResult ?? "";
   const devJson = state.devOutput ?? "{}";
   const pmJson = state.pmOutput ?? "{}";
-  const trace = langfuse.trace({
-    name: "brs-pipeline",
-    input: {
-      runId: state.runId,
-      documentText: state.documentText,
-      fetchResult: fetchJson,
-      devOutput: devJson,
-      pmOutput: pmJson,
-    },
-  });
+  const trace = await getOrCreatePipelineTrace(state.runId);
   const prompt = interpolate(REVIEWER_AGENT_PROMPT, {
     FETCH_AGENT_JSON: fetchJson,
     DEV_AGENT_JSON: devJson,
@@ -598,7 +755,7 @@ async function reviewerAgent(state: PipelineStateType): Promise<Partial<Pipeline
   });
   const span = trace.span({
     name: "reviewerAgent",
-    input: { prompt },
+    input: { promptChars: prompt.length, promptSha256: sha256Hex(prompt) },
   });
 
   try {
@@ -609,7 +766,11 @@ async function reviewerAgent(state: PipelineStateType): Promise<Partial<Pipeline
 
     await updateRun(state.runId, { "stages.review": "running" });
 
-    const raw = await callReviewerModel(prompt);
+    const raw = await callReviewerModel({
+      trace,
+      step: "reviewer_agent",
+      prompt,
+    });
     const parsed = parseReviewerOutput(raw);
     const pass = (state.reviewPassCount ?? 0) + 1;
 
@@ -630,11 +791,25 @@ async function reviewerAgent(state: PipelineStateType): Promise<Partial<Pipeline
 
     span.end({
       output: {
-        reviewerRaw: raw,
-        parsedReview: parsed,
         ready_for_merge: ready,
         escalatedMergeRequest: escalated,
         reviewPass: pass,
+        dev_confidence: parsed.summary.dev_confidence,
+        pm_confidence: parsed.summary.pm_confidence,
+        overall_system_confidence: parsed.summary.overall_system_confidence,
+        blockingIssueCount: parsed.summary.blocking_issues?.length ?? 0,
+      },
+    });
+
+    trace.update({
+      metadata: {
+        reviewPassCount: pass,
+        rerunsAfterBlock: state.rerunsAfterBlock ?? 0,
+        ready_for_merge: ready,
+        escalatedMergeRequest: escalated,
+        dev_confidence: parsed.summary.dev_confidence,
+        pm_confidence: parsed.summary.pm_confidence,
+        overall_system_confidence: parsed.summary.overall_system_confidence,
       },
     });
 
@@ -665,16 +840,7 @@ function routeAfterReviewer(
 
 async function selectiveRerun(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({
-    name: "brs-pipeline",
-    input: {
-      runId: state.runId,
-      documentText: state.documentText,
-      fetchResult: state.fetchResult,
-      devOutput: state.devOutput,
-      pmOutput: state.pmOutput,
-    },
-  });
+  const trace = await getOrCreatePipelineTrace(state.runId);
 
   try {
     if (await stopIfRequested(state.runId)) {
@@ -695,6 +861,7 @@ async function selectiveRerun(state: PipelineStateType): Promise<Partial<Pipelin
     const correctivesPmStr = buildCorrectivesForPm(review);
 
     const nextReruns = (state.rerunsAfterBlock ?? 0) + 1;
+    trace.update({ metadata: { rerunsAfterBlock: nextReruns } });
 
     const devPrompt = dev
       ? interpolate(DEV_CHECKLIST_PROMPT, {
@@ -712,13 +879,14 @@ async function selectiveRerun(state: PipelineStateType): Promise<Partial<Pipelin
     const span = trace.span({
       name: "selectiveRerun",
       input: {
-        lastParsedReview: review,
-        correctivesDev: correctivesDevStr,
-        correctivesPm: correctivesPmStr,
         devRerun: dev,
         pmRerun: pm,
-        devPrompt,
-        pmPrompt,
+        correctivesDevChars: correctivesDevStr.length,
+        correctivesDevSha256: sha256Hex(correctivesDevStr),
+        correctivesPmChars: correctivesPmStr.length,
+        correctivesPmSha256: sha256Hex(correctivesPmStr),
+        devPromptChars: devPrompt?.length ?? 0,
+        pmPromptChars: pmPrompt?.length ?? 0,
       },
     });
 
@@ -727,7 +895,13 @@ async function selectiveRerun(state: PipelineStateType): Promise<Partial<Pipelin
       tasks.push(
         (async () => {
           await updateRun(state.runId, { "stages.dev": "running" });
-          const result = await callModel("dev", devPrompt);
+          const result = await callModel({
+            trace,
+            role: "dev",
+            step: "dev_agent_rerun",
+            prompt: devPrompt,
+            metadata: { rerunAttempt: nextReruns },
+          });
           await updateRun(state.runId, { "stages.dev": "done", devOutput: result });
         })()
       );
@@ -736,7 +910,13 @@ async function selectiveRerun(state: PipelineStateType): Promise<Partial<Pipelin
       tasks.push(
         (async () => {
           await updateRun(state.runId, { "stages.pm": "running" });
-          const result = await callModel("pm", pmPrompt);
+          const result = await callModel({
+            trace,
+            role: "pm",
+            step: "pm_agent_rerun",
+            prompt: pmPrompt,
+            metadata: { rerunAttempt: nextReruns },
+          });
           await updateRun(state.runId, { "stages.pm": "done", pmOutput: result });
         })()
       );
@@ -769,15 +949,7 @@ async function selectiveRerun(state: PipelineStateType): Promise<Partial<Pipelin
 
 async function mergeAgents(state: PipelineStateType): Promise<Partial<PipelineStateType>> {
   const langfuse = getLangfuse();
-  const trace = langfuse.trace({
-    name: "brs-pipeline",
-    input: {
-      runId: state.runId,
-      documentText: state.documentText,
-      devOutput: state.devOutput,
-      pmOutput: state.pmOutput,
-    },
-  });
+  const trace = await getOrCreatePipelineTrace(state.runId);
 
   try {
     if (await stopIfRequested(state.runId)) {
@@ -799,11 +971,25 @@ async function mergeAgents(state: PipelineStateType): Promise<Partial<PipelineSt
       devChecklist: state.devOutput ?? "{}",
       pmChecklist: state.pmOutput ?? "{}",
     });
-    const span = trace.span({ name: "mergeAgents", input: { prompt } });
-    const result = await callModel("default", prompt);
+    const span = trace.span({
+      name: "mergeAgents",
+      input: { promptChars: prompt.length, promptSha256: sha256Hex(prompt) },
+    });
+    const result = await callModel({
+      trace,
+      role: "default",
+      step: "merge_agent",
+      prompt,
+    });
     const mergedReportText = formatJsonLikeOutput(result);
 
     const escalated = state.escalatedMergeRequest === true;
+    trace.update({
+      metadata: {
+        mergeEscalated: escalated,
+        mergeSource: escalated ? "escalated_after_max_retries" : "reviewer_approved",
+      },
+    });
 
     // Persist merged report first, then attempt embedding (embedding failure must not fail the pipeline).
     if (escalated) {
@@ -836,7 +1022,13 @@ async function mergeAgents(state: PipelineStateType): Promise<Partial<PipelineSt
       }
     }
 
-    span.end({ output: { mergedReport: mergedReportText, escalated } });
+    span.end({
+      output: {
+        mergedReportChars: mergedReportText.length,
+        mergedReportSha256: sha256Hex(mergedReportText),
+        escalated,
+      },
+    });
     return { mergedReport: mergedReportText };
   } finally {
     await langfuse.flushAsync();
@@ -847,7 +1039,6 @@ async function mergeAgents(state: PipelineStateType): Promise<Partial<PipelineSt
 
 const graph = new StateGraph(PipelineState)
   .addNode("embedAndMeasure", embedAndMeasure)
-  .addNode("fetchSmall", fetchSmall)
   .addNode("chunkAndFetch", chunkAndFetch)
   .addNode("devAgent", devAgent)
   .addNode("pmAgent", pmAgent)
@@ -855,13 +1046,10 @@ const graph = new StateGraph(PipelineState)
   .addNode("selectiveRerun", selectiveRerun)
   .addNode("mergeAgents", mergeAgents)
   .addEdge(START, "embedAndMeasure")
-  .addConditionalEdges("embedAndMeasure", routeBySize, {
+  .addConditionalEdges("embedAndMeasure", routeAfterEmbed, {
     end: END,
-    fetchSmall: "fetchSmall",
     chunkAndFetch: "chunkAndFetch",
   })
-  .addEdge("fetchSmall", "devAgent")
-  .addEdge("fetchSmall", "pmAgent")
   .addEdge("chunkAndFetch", "devAgent")
   .addEdge("chunkAndFetch", "pmAgent")
   .addEdge("devAgent", "reviewerAgent")

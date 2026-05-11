@@ -40,8 +40,8 @@ ARN automates the tedious first pass of analyzing a BRS document. A product mana
                           ┌─────────────────────────────────────────┐
                           │           LangGraph State Machine        │
                           │                                           │
-  Upload BRS Doc          │  embedAndMeasure → fetchSmall            │
-  (PDF/DOCX/TXT)  ──────► │                 └─ chunkAndFetch         │
+  Upload BRS Doc          │  embedAndMeasure → chunkAndFetch          │
+  (PDF/DOCX/TXT)  ──────► │                                           │
                           │                         │                 │
                           │              ┌──────────┴──────────┐      │
                           │              ▼                      ▼      │
@@ -166,9 +166,8 @@ AI-Requirement-Analyzer/
 
 | Node | Description |
 |---|---|
-| `embedAndMeasure` | Classifies input as small/large, chunks if needed, generates Voyage embeddings, persists to MongoDB |
-| `fetchSmall` | Runs Fetch agent on the full document (small path) |
-| `chunkAndFetch` | Runs Fetch agent per chunk then merges outputs (large path) |
+| `embedAndMeasure` | Section-wise + recursive chunking; embeds chunks to Qdrant (`brs_chunk`); persists metadata to MongoDB |
+| `chunkAndFetch` | Runs Fetch agent per chunk then merges outputs |
 | `devAgent` | Developer checklist agent — technical feasibility, dependencies, edge cases |
 | `pmAgent` | PM checklist agent — scope, acceptance criteria, stakeholder concerns |
 | `reviewerAgent` | Reviews both agent outputs; Zod-validates JSON; emits `ready_for_merge` or blocking issues with responsible agent |
@@ -289,7 +288,6 @@ OPENAI_MAX_TOKENS=8000
 OPENAI_BRS_REVIEWER_MODEL=o4-mini   # Reasoning model for reviewer
 
 # BRS pipeline tuning
-BRS_SMALL_INPUT_TOKEN_THRESHOLD=4000
 CHUNK_SIZE=1500
 CHUNK_OVERLAP=200
 

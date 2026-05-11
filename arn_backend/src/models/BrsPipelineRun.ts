@@ -21,6 +21,10 @@ export interface IReviewOutputEntry {
 
 export interface IBrsPipelineRun extends Document {
   status: RunStatus;
+  /** Langfuse trace id for correlating this run to observability data. */
+  langfuseTraceId?: string;
+  /** Optional host used for linking to Langfuse UI (e.g. https://cloud.langfuse.com). */
+  langfuseHost?: string;
   control?: {
     stopRequestedAt?: Date;
     pausedAt?: Date;
@@ -99,6 +103,8 @@ const BrsPipelineRunSchema = new Schema<IBrsPipelineRun>(
       default: "queued",
       required: true,
     },
+    langfuseTraceId: { type: String },
+    langfuseHost: { type: String },
     control: {
       stopRequestedAt: { type: Date },
       pausedAt: { type: Date },

@@ -10,8 +10,24 @@ import {
 } from "../services/qdrantBrsStore";
 import { embedMergeReportForRun } from "../services/mergeReportRagChunks";
 import { buildBrsRunDocxBuffer, safeDocxAttachmentName } from "../services/brsRunDocxExport";
+import { emitBrsRunChanged, onBrsRunChanged } from "../services/brsRunEvents";
 
 const router = Router();
+
+function writeSseEvent(response: Response, args: { event?: string; data: unknown }): void {
+  if (args.event) response.write(`event: ${args.event}\n`);
+  response.write(`data: ${JSON.stringify(args.data)}\n\n`);
+}
+
+function isTerminalStatus(status: unknown): boolean {
+  return (
+    status === "done" ||
+    status === "error" ||
+    status === "needs_human_review" ||
+    status === "awaiting_user_decision" ||
+    status === "paused"
+  );
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -61,6 +77,7 @@ router.post(
       });
 
       const runId = run._id.toString();
+      emitBrsRunChanged(runId, ["status", "stages", "displayName", "originalFileName"]);
 
       // Extract text and launch pipeline asynchronously
       extractDocumentText(req.file.buffer, req.file.mimetype)
@@ -78,6 +95,55 @@ router.post(
     }
   }
 );
+
+// GET /api/brs/runs/:id/stream — live SSE updates for a single run
+router.get("/runs/:id/stream", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    // Helpful when behind some proxies.
+    res.setHeader("X-Accel-Buffering", "no");
+
+    // Send initial snapshot.
+    const runId = req.params.id;
+    const initial = await BrsPipelineRun.findById(runId).lean();
+    if (!initial) {
+      writeSseEvent(res, { event: "error", data: { error: "Run not found" } });
+      res.end();
+      return;
+    }
+    writeSseEvent(res, { event: "run", data: initial });
+
+    // Keepalive ping so intermediaries don't close idle connections.
+    const keepalive = setInterval(() => {
+      writeSseEvent(res, { event: "ping", data: { at: Date.now() } });
+    }, 25_000);
+
+    const unsubscribe = onBrsRunChanged(async (evt) => {
+      if (evt.runId !== runId) return;
+      const latest = await BrsPipelineRun.findById(runId).lean();
+      if (!latest) {
+        writeSseEvent(res, { event: "end", data: { reason: "deleted" } });
+        res.end();
+        return;
+      }
+      writeSseEvent(res, { event: "run", data: latest });
+      if (isTerminalStatus((latest as any).status)) {
+        writeSseEvent(res, { event: "end", data: { status: (latest as any).status } });
+        res.end();
+      }
+    });
+
+    req.on("close", () => {
+      clearInterval(keepalive);
+      unsubscribe();
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // GET /api/brs/runs
 router.get("/runs", async (_req: Request, res: Response, next: NextFunction) => {
@@ -107,6 +173,69 @@ router.get("/runs", async (_req: Request, res: Response, next: NextFunction) => 
     res.json({
       runs,
       stats: { total, inPipeline, reportsReady, avgDuration },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/brs/stream — live SSE updates for dashboard (runs + stats)
+router.get("/stream", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+
+    async function buildDashboardPayload() {
+      const runs = await BrsPipelineRun.find().sort({ createdAt: -1 }).limit(50).lean();
+      const total = await BrsPipelineRun.countDocuments();
+      const inPipeline = await BrsPipelineRun.countDocuments({ status: "running" });
+      const reportsReady = await BrsPipelineRun.countDocuments({ status: "done" });
+      const completedRuns = await BrsPipelineRun.find({
+        status: "done",
+        completedAt: { $exists: true },
+      })
+        .select("createdAt completedAt")
+        .lean();
+
+      const avgDuration =
+        completedRuns.length > 0
+          ? completedRuns.reduce((sum, r) => {
+              const duration = new Date(r.completedAt!).getTime() - new Date(r.createdAt).getTime();
+              return sum + duration;
+            }, 0) / completedRuns.length
+          : 0;
+
+      return { runs, stats: { total, inPipeline, reportsReady, avgDuration } };
+    }
+
+    writeSseEvent(res, { event: "dashboard", data: await buildDashboardPayload() });
+
+    const keepalive = setInterval(() => {
+      writeSseEvent(res, { event: "ping", data: { at: Date.now() } });
+    }, 25_000);
+
+    let pending = false;
+    let scheduled: NodeJS.Timeout | null = null;
+    const enqueueSend = () => {
+      pending = true;
+      if (scheduled) return;
+      scheduled = setTimeout(async () => {
+        scheduled = null;
+        if (!pending) return;
+        pending = false;
+        writeSseEvent(res, { event: "dashboard", data: await buildDashboardPayload() });
+      }, 250);
+    };
+
+    const unsubscribe = onBrsRunChanged(() => enqueueSend());
+
+    req.on("close", () => {
+      clearInterval(keepalive);
+      unsubscribe();
+      if (scheduled) clearTimeout(scheduled);
     });
   } catch (err) {
     next(err);
@@ -180,6 +309,7 @@ router.post(
         run.completedAt = new Date();
         run.awaitingUserDecision = false;
         await run.save();
+        emitBrsRunChanged(run._id.toString(), ["status", "completedAt", "awaitingUserDecision"]);
         try {
           await embedMergeReportForRun(run._id.toString());
         } catch (embedErr) {
@@ -195,6 +325,7 @@ router.post(
       run.stages.merge = "pending";
       run.status = "needs_human_review";
       await run.save();
+      emitBrsRunChanged(run._id.toString(), ["status", "stages", "mergedReport", "mergeSource", "awaitingUserDecision"]);
       try {
         await deleteMergeReportPointsForRun(run._id.toString());
       } catch (delErr) {
@@ -257,6 +388,7 @@ router.post("/runs/:id/control", async (req: Request, res: Response, next: NextF
         if (current === "running") (run.stages as any)[key] = "pending";
       }
       await run.save();
+      emitBrsRunChanged(run._id.toString(), ["status", "control", "stages"]);
       res.json({ ok: true, status: run.status });
       return;
     }
@@ -282,6 +414,7 @@ router.post("/runs/:id/control", async (req: Request, res: Response, next: NextF
       if (current === "running") (run.stages as any)[key] = "pending";
     }
     await run.save();
+    emitBrsRunChanged(run._id.toString(), ["status", "control", "stages"]);
 
     // Fire-and-forget resume from stored document text.
     void launchBrsPipeline(run._id.toString(), run.documentText);
@@ -307,6 +440,7 @@ router.delete("/runs/:id", async (req: Request, res: Response, next: NextFunctio
       console.error(`Qdrant delete failed for run ${id}:`, qErr);
     }
     await BrsPipelineRun.deleteOne({ _id: id });
+    emitBrsRunChanged(id, ["deleted"]);
     res.status(204).send();
   } catch (err) {
     next(err);

@@ -6,7 +6,7 @@ import { PipelineTracker } from "../components/PipelineTracker";
 import { AgentOutputsGrid } from "../components/AgentOutputsGrid";
 import { MergedReportCard } from "../components/MergedReportCard";
 import { Snackbar } from "../components/Snackbar";
-import { submitBrs, getRuns } from "../api/brs";
+import { submitBrs } from "../api/brs";
 import type { Stats } from "../api/brs";
 
 type NavState = {
@@ -18,26 +18,32 @@ export function Dashboard() {
   const location = useLocation();
   const [stats, setStats] = useState<Stats | null>(null);
   const [snack, setSnack] = useState<NavState["snackbar"] | null>(null);
+  const [liveDisconnected, setLiveDisconnected] = useState(false);
 
   const navSnack = useMemo(() => (location.state as NavState | null)?.snackbar ?? null, [location.state]);
 
   useEffect(() => {
-    let active = true;
+    const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "http://localhost:3000";
+    setLiveDisconnected(false);
+    const source = new EventSource(`${BASE_URL}/api/brs/stream`);
 
-    async function fetchStats() {
+    source.addEventListener("dashboard", (evt) => {
       try {
-        const { stats: s } = await getRuns();
-        if (active) setStats(s);
+        const parsed = JSON.parse((evt as MessageEvent).data) as { stats?: Stats };
+        if (parsed.stats) setStats(parsed.stats);
+        setLiveDisconnected(false);
       } catch {
-        // stats fetch failure is non-critical; silently skip
+        // non-critical
       }
-    }
+    });
 
-    fetchStats();
-    const timer = setInterval(fetchStats, 10_000);
+    source.onerror = () => {
+      setLiveDisconnected(true);
+      source.close();
+    };
+
     return () => {
-      active = false;
-      clearInterval(timer);
+      source.close();
     };
   }, []);
 
@@ -61,6 +67,9 @@ export function Dashboard() {
         message={snack?.message ?? ""}
         onClose={() => setSnack(null)}
       />
+      {liveDisconnected ? (
+        <p className="card__error">Live updates disconnected. Stats may be stale.</p>
+      ) : null}
       <StatsRow
         total={stats?.total}
         inPipeline={stats?.inPipeline}

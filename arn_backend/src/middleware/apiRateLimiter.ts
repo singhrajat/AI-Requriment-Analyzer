@@ -28,6 +28,14 @@ export const apiRateLimiter = rateLimit({
   limit,
   standardHeaders: "draft-7",
   legacyHeaders: false,
+  // SSE endpoints are long-lived connections; they should not consume the same
+  // short-lived request budget as normal APIs.
+  skip: (request: Request) => {
+    const path = request.path || "";
+    if (path.startsWith("/api/brs/stream")) return true;
+    if (path.startsWith("/api/brs/runs/") && path.endsWith("/stream")) return true;
+    return false;
+  },
   handler: (
     request: Request,
     response: Response,

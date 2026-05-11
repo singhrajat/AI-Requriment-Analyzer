@@ -1,5 +1,7 @@
 import "./loadEnv";
 import { apiRateLimiter } from "./middleware/apiRateLimiter";
+import { attachXRequestIdHeader, httpLogger } from "./middleware/httpLogger";
+import { logger } from "./logger";
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import mongoose from "mongoose";
@@ -24,6 +26,9 @@ const port = Number(process.env.PORT) || 3000;
 
 configureTrustProxy(app);
 
+app.use(httpLogger);
+app.use(attachXRequestIdHeader);
+
 app.use(
   cors({
     origin: [
@@ -33,7 +38,7 @@ app.use(
       
     ],
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Request-Id"],
   })
 );
 app.use(express.json());
@@ -51,8 +56,12 @@ app.use("/api/brs", brsRouter);
 app.use("/api/chat", chatRouter);
 
 // Global error handler
-app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-  console.error(err);
+app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+  if (req.log) {
+    req.log.error({ err }, "unhandled error");
+  } else {
+    logger.error({ err }, "unhandled error");
+  }
   res.status(500).json({ error: err.message ?? "Internal server error" });
 });
 
@@ -63,14 +72,15 @@ async function start() {
   }
 
   await mongoose.connect(mongoUri);
-  console.log("MongoDB connected");
+  logger.info("MongoDB connected");
 
   app.listen(port, () => {
-    console.log(`Server listening on http://localhost:${port}`);
+    logger.info({ port }, "Server listening");
   });
 }
 
-start().catch((err) => {
-  console.error("Failed to start server:", err);
+start().catch((err: unknown) => {
+  const e = err instanceof Error ? err : new Error(String(err));
+  logger.fatal({ err: e }, "Failed to start server");
   process.exit(1);
 });

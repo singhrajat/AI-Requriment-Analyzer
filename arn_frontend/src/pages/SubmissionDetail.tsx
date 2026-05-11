@@ -7,50 +7,58 @@ import { AgentOutputsGrid } from "../components/AgentOutputsGrid";
 import { MergedReportCard } from "../components/MergedReportCard";
 import { ReviewerSummaryCard } from "../components/ReviewerSummaryCard";
 
-const POLL_INTERVAL_MS = 3000;
-
-function shouldStopPolling(status: BrsRun["status"]): boolean {
-  return (
-    status === "done" ||
-    status === "error" ||
-    status === "needs_human_review" ||
-    status === "awaiting_user_decision" ||
-    status === "paused"
-  );
-}
+const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "http://localhost:3000";
 
 export function SubmissionDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [run, setRun] = useState<BrsRun | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [liveDisconnected, setLiveDisconnected] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [decisionBusy, setDecisionBusy] = useState(false);
   const [controlBusy, setControlBusy] = useState<"stop" | "resume" | "discard" | null>(null);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
     if (!id) return;
     const runId = id;
 
-    async function load() {
+    setError(null);
+    setLiveDisconnected(false);
+
+    if (sourceRef.current) sourceRef.current.close();
+
+    const source = new EventSource(`${BASE_URL}/api/brs/runs/${encodeURIComponent(runId)}/stream`);
+    sourceRef.current = source;
+
+    source.addEventListener("run", (evt) => {
       try {
-        setError(null);
+        const data = JSON.parse((evt as MessageEvent).data) as BrsRun;
+        setRun(data);
+        setLiveDisconnected(false);
+      } catch {
+        setError("Failed to parse live update.");
+      }
+    });
+
+    source.addEventListener("end", () => {
+      source.close();
+    });
+
+    source.onerror = async () => {
+      setLiveDisconnected(true);
+      source.close();
+      try {
         const data = await getRun(runId);
         setRun(data);
-        if (shouldStopPolling(data.status)) {
-          if (intervalRef.current) clearInterval(intervalRef.current);
-        }
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to load submission.");
-        if (intervalRef.current) clearInterval(intervalRef.current);
       }
-    }
+    };
 
-    load();
-    intervalRef.current = setInterval(load, POLL_INTERVAL_MS);
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (sourceRef.current) sourceRef.current.close();
     };
   }, [id]);
 
@@ -223,6 +231,9 @@ export function SubmissionDetail() {
         </div>
       </div>
 
+      {liveDisconnected ? (
+        <p className="card__error">Live updates disconnected. Showing last known status.</p>
+      ) : null}
       {error ? <p className="card__error">{error}</p> : null}
 
       <header className="submission-detail__header">

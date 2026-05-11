@@ -135,6 +135,21 @@ export function getChatModelIdForRole(role: Exclude<ChatModelRole, "reviewer">):
   return getRoleModelId(role);
 }
 
+/** Telemetry for pipeline agents: per-role model id + effective params. */
+export function getChatModelTelemetryForRole(role: Exclude<ChatModelRole, "reviewer">): {
+  modelName: string;
+  temperature: number;
+  maxTokens: number;
+} {
+  const base = getModelConfig();
+  const modelName = getRoleModelId(role);
+  return {
+    modelName,
+    temperature: effectiveOpenAiTemperature(modelName, base.temperature),
+    maxTokens: base.maxTokens,
+  };
+}
+
 /** BRS Reviewer Agent — model from `OPENAI_BRS_REVIEWER_MODEL` (reasoning-class per RULE-REVIEW-004). */
 export function getReviewerChatModel(): ChatOpenAI {
   const base = getModelConfig();
@@ -147,6 +162,20 @@ export function getReviewerChatModel(): ChatOpenAI {
     temperature,
     maxTokens: config.maxTokens,
   });
+}
+
+export function getReviewerModelTelemetry(): {
+  modelName: string;
+  temperature: number;
+  maxTokens: number;
+} {
+  const base = getModelConfig();
+  const modelName = requireEnv("OPENAI_BRS_REVIEWER_MODEL");
+  return {
+    modelName,
+    temperature: effectiveOpenAiTemperature(modelName, base.temperature),
+    maxTokens: base.maxTokens,
+  };
 }
 
 let _openAiEmbeddings: OpenAIEmbeddings | null = null;
